@@ -55,7 +55,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             true,
             schema,
         ))
-        .temperature(0.01f64)
+        .temperature(0.0f64)
         .build()?;
 
     //    loop {
