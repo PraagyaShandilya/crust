@@ -10,7 +10,15 @@ use rsbash::rashf;
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{env, error::Error, fmt::format, io, process::exit, result, time::Duration};
+use std::{
+    env,
+    error::Error,
+    fmt::format,
+    io::{self, Read, Seek, SeekFrom, Write},
+    process::exit,
+    result,
+    time::Duration,
+};
 use tavily::Tavily;
 use tokio::fs::read_link;
 
@@ -64,7 +72,7 @@ impl TypedTool for WebSearchParams {
 // tool setup for bash commands
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
 struct BashParams {
-    timeout: u16,
+    timeout: u32,
     command: String,
 }
 
@@ -82,7 +90,7 @@ impl TypedTool for BashParams {
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
 struct ReadFileParams {
     filename: String,
-    offset: usize,
+    offset: u64,
     limit: usize,
 }
 
@@ -179,7 +187,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let response = client.chat().create(&request).await?;
 
             let Some(choice) = response.choices.first() else {
-                println!("Crust Agent: No Response quitting.........");
+                println!("\nCrust Agent: No Response quitting.........");
                 break;
             };
 
@@ -225,6 +233,8 @@ async fn execute_tool_call(
     tc: &ToolCall,
     tavily_api_key: String,
 ) -> Result<String, Box<dyn Error>> {
+    //Web Search tool exec
+
     if tc.is_tool::<WebSearchParams>() {
         let params = tc.parse_params::<WebSearchParams>()?;
         let tavily = Tavily::builder(tavily_api_key)
@@ -269,6 +279,8 @@ async fn execute_tool_call(
 
         return Ok(serde_json::to_string_pretty(&websearch)?);
     }
+    // Bash Tool exec
+
     if tc.is_tool::<BashParams>() {
         let params = tc.parse_params::<BashParams>()?;
         let (exitcode, output, error) = rashf!("timeout {} {}", params.timeout, params.command)?;
@@ -279,14 +291,46 @@ async fn execute_tool_call(
         });
         return Ok(serde_json::to_string_pretty(&bashresults)?);
     }
+
     if tc.is_tool::<ReadFileParams>() {
         let params = tc.parse_params::<ReadFileParams>()?;
-        return Ok("read file activated".to_string());
+        let cursor_start = params.offset.clone();
+        let filename = params.filename.clone();
+        let end = params.limit.clone();
+        let file = std::fs::File::open(params.filename)?;
+        let mut reader = std::io::BufReader::new(file);
+        reader.seek(SeekFrom::Start(params.offset))?;
+
+        let mut buffer = [0; 1_048_576];
+
+        reader.read(&mut buffer)?;
+
+        let readfileresults = json!(
+            {
+                "filename" : filename,
+                "offset" : cursor_start,
+                "end"    : end,
+                "content": buffer[..end],
+            }
+        );
+
+        return Ok(serde_json::to_string_pretty(&readfileresults)?);
     }
+
     if tc.is_tool::<WriteFileParams>() {
         let params = tc.parse_params::<WriteFileParams>()?;
-        return Ok("write file activated".to_string());
+        let filename = params.filename;
+        let content = params.content;
+        let file = std::fs::File::open(&filename)?;
+        let mut writer = std::io::BufWriter::new(file);
+        writer.write(content.as_bytes())?;
+
+        let writerresults = json!({
+            "filename":filename
+        });
+        return Ok(serde_json::to_string_pretty(&writerresults)?);
     }
+
     if tc.is_tool::<EditFileParams>() {
         let params = tc.parse_params::<EditFileParams>()?;
         return Ok("edit file activated".to_string());
@@ -294,7 +338,6 @@ async fn execute_tool_call(
 
     Ok("unhandled tool:{tc.name()}".to_string())
 }
-
 // for step in 1..=MAX_AGENT_STEPS {
 //         let request = ChatCompletionRequest::builder()
 //             .model(model.clone())
