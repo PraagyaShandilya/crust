@@ -1,26 +1,21 @@
+mod session;
 use openrouter_rs::{
     Content, OpenRouterClient,
-    api::chat::{ChatCompletionRequest, Message},
-    types::{
-        ResponseFormat, Role, ToolCall,
-        typed_tool::{TypedTool, TypedToolParams},
-    },
+    api::chat::Message,
+    types::{Role, ToolCall, typed_tool::TypedTool},
 };
 use rsbash::rashf;
-use schemars::{JsonSchema, schema_for};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use session::SessionManager;
 use std::{
     env,
     error::Error,
-    fmt::format,
     io::{self, Read, Seek, SeekFrom, Write},
-    process::exit,
-    result,
     time::Duration,
 };
 use tavily::Tavily;
-use tokio::fs::read_link;
 
 fn generate_landing_page() -> String {
     r#"
@@ -35,9 +30,9 @@ fn generate_landing_page() -> String {
             ▒▒▒▒▒▒            ▒▒▒▒        ▒▒▒▒            ▒▒▒▒▒▒
             ▒▒▒▒▒▒            ▒▒▒▒        ▒▒▒▒            ▒▒▒▒▒▒
             ▒▒▒▒▒▒        ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒        ▒▒▒▒▒▒
-            ▒▒▒▒▒▒▒▒    ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒    ▒▒▒▒▒▒▒▒
-              ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
-            ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+            ▒▒▒▒▒▒▒▒    ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒    ▒▒▒▒▒▒▒▒
+              ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
+            ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
           ▒▒▒▒    ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒    ▒▒▒▒
         ▒▒▒▒        ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒        ▒▒▒▒
         ▒▒▒▒        ▒▒▒▒    ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒    ▒▒▒▒        ▒▒▒▒
@@ -112,7 +107,7 @@ struct WriteFileParams {
 
 impl TypedTool for WriteFileParams {
     fn name() -> &'static str {
-        "read_file_tool"
+        "write_file_tool"
     }
     fn description() -> &'static str {
         "Write a file using its file name and a content string"
@@ -138,22 +133,36 @@ impl TypedTool for EditFileParams {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    // Load .env from the current directory, falling back to the project root.
     dotenvy::dotenv().ok();
+    dotenvy::from_filename(concat!(env!("CARGO_MANIFEST_DIR"), "/.env")).ok();
 
     let max_agent_steps = env::var("MAX_AGENT_STEPS")
         .unwrap_or("5".to_string())
         .parse::<u32>()?;
 
     let tavily_api_key = env::var("TAVILY_API_KEY").expect("TAVILY_API_KEY must be set");
+
     let api_key = env::var("OPENROUTER_API_KEY").expect("OPENROUTER_API_KEY must be set");
+
     let client = OpenRouterClient::builder().api_key(api_key).build()?;
+
     let modelname = env::var("OPENROUTER_MAIN_MODEL")
-        .unwrap_or_else(|_| "~moonshotai/kimi-latest".to_string())
+        .unwrap_or_else(|_| "moonshotai/kimi-latest".to_string())
         .to_string();
-    let mut messages = vec![Message::new(
-        Role::System,
-        "You are an AI agent given tools to be able to help people",
-    )];
+
+    println!("Using OpenRouter model: {modelname}");
+
+    // Initialize messages with system prompt
+    let system_message = r#"You are an AI agent given tools to be able to help people you can use the
+        bash tool to run unix commands in the shell, the read write and edit tools
+        respectively for editing files that you know the filenames of and the web search
+        tool to interface with the web."#;
+
+    // Initialize Session Manager
+    let mut session_manager = SessionManager::new();
+    let default_session = session_manager.create_session("Default".to_string(), system_message);
+    println!("Created session: {}", default_session.name);
 
     println!("{}", generate_landing_page());
 
@@ -165,17 +174,78 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .read_line(&mut prompt)
             .expect("Failed to capture prompt: \n");
 
-        if prompt.clone().trim() == "/exit" {
+        let prompt_trimmed = prompt.trim();
+
+        // Session Management Commands
+        if prompt_trimmed.starts_with("/new ") {
+            let session_name = prompt_trimmed[5..].trim().to_string();
+            if session_name.is_empty() {
+                println!("Usage: /new <session_name>");
+                continue;
+            }
+            let new_session = session_manager.create_session(session_name, system_message);
+            println!("Created new session: {}", new_session.name);
+            continue;
+        }
+
+        if prompt_trimmed == "/list" {
+            println!("\n--- Sessions ---");
+            for session in session_manager.list_sessions() {
+                let current_marker = if session_manager
+                    .get_current_session()
+                    .map_or(false, |s| s.id == session.id)
+                {
+                    " (current)"
+                } else {
+                    ""
+                };
+                println!(
+                    "ID: {} | Name: {} | Messages: {}{}",
+                    session.id,
+                    session.name,
+                    session.messages.len(),
+                    current_marker
+                );
+            }
+            println!("----------------");
+            continue;
+        }
+
+        if prompt_trimmed.starts_with("/switch ") {
+            let session_id = prompt_trimmed[8..].trim();
+            match session_manager.switch_session(session_id) {
+                Ok(session) => println!("Switched to session: {}", session.name),
+                Err(e) => println!("Error: {}", e),
+            }
+            continue;
+        }
+
+        if prompt_trimmed == "/exit" {
             println!("Crust agent quitting.....\n");
             break;
         }
 
-        messages.push(Message::new(Role::User, prompt));
+        // Add user message to session
+        let user_message = Message {
+            role: Role::User,
+            content: Content::Text(prompt),
+            tool_call_id: None,
+            name: None,
+            tool_calls: None,
+        };
+        session_manager.add_message_to_current(user_message);
 
         for _ in 0..max_agent_steps {
+            // Get current messages for API request
+            let current_messages = session_manager
+                .get_current_session()
+                .unwrap()
+                .messages
+                .clone();
+
             let request = openrouter_rs::api::chat::ChatCompletionRequest::builder()
                 .model(&modelname)
-                .messages(messages.clone())
+                .messages(current_messages.clone()) // Use cloned messages
                 .typed_tool::<WebSearchParams>()
                 .typed_tool::<BashParams>()
                 .typed_tool::<ReadFileParams>()
@@ -184,15 +254,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .temperature(0.2f64)
                 .build()?;
 
-            let response = client.chat().create(&request).await?;
+            let response = match client.chat().create(&request).await {
+                Ok(response) => response,
+                Err(err) => {
+                    eprintln!("OpenRouter request failed for model `{modelname}`: {err:?}");
+                    return Err(Box::new(err) as Box<dyn Error>);
+                }
+            };
 
             let Some(choice) = response.choices.first() else {
                 println!("\nCrust Agent: No Response quitting.........");
                 break;
             };
 
+            if let Some(details) = choice.reasoning_details() {
+                for block in details {
+                    if let Some(text) = block.content() {
+                        println!("Thinking block [{}]:\n{}", block.reasoning_type(), text);
+                    }
+                }
+            }
+
             if let Some(tool_calls) = choice.tool_calls() {
-                messages.push(Message::assistant_with_tool_calls(
+                // Add assistant message with tool calls to session
+                session_manager.add_message_to_current(Message::assistant_with_tool_calls(
                     choice.content().unwrap_or(""),
                     tool_calls.to_vec(),
                 ));
@@ -201,7 +286,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     let tool_result =
                         execute_tool_call(tool_call, tavily_api_key.to_string()).await?;
                     println!("tool call:  {} -> {}", tool_call.name(), tool_result);
-                    messages.push(Message::tool_response_named(
+
+                    // Add tool response to session
+                    session_manager.add_message_to_current(Message::tool_response_named(
                         tool_call.id(),
                         tool_call.name(),
                         tool_result,
@@ -211,12 +298,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 continue;
             } else {
                 println!(
-                    "{}\nCrust Agent:{}\n{}",
+                    "{}Crust Agent:{}\n{}",
                     ("=").repeat(50),
                     ("=").repeat(50),
                     choice.content().unwrap_or("")
                 );
-                messages.push(Message::new(
+
+                // Add final assistant message to session
+                session_manager.add_message_to_current(Message::new(
                     Role::Assistant,
                     choice.content().unwrap_or(""),
                 ));
@@ -294,23 +383,24 @@ async fn execute_tool_call(
 
     if tc.is_tool::<ReadFileParams>() {
         let params = tc.parse_params::<ReadFileParams>()?;
-        let cursor_start = params.offset.clone();
+        let cursor_start = params.offset;
         let filename = params.filename.clone();
-        let end = params.limit.clone();
-        let file = std::fs::File::open(params.filename)?;
+        let limit = params.limit.min(1_048_576);
+        let file = std::fs::File::open(&filename)?;
         let mut reader = std::io::BufReader::new(file);
         reader.seek(SeekFrom::Start(params.offset))?;
 
-        let mut buffer = [0; 1_048_576];
-
-        reader.read(&mut buffer)?;
+        let mut buffer = vec![0; limit];
+        let bytes_read = reader.read(&mut buffer)?;
+        buffer.truncate(bytes_read);
+        let content = String::from_utf8_lossy(&buffer).to_string();
 
         let readfileresults = json!(
             {
                 "filename" : filename,
                 "offset" : cursor_start,
-                "end"    : end,
-                "content": buffer[..end],
+                "bytes_read" : bytes_read,
+                "content": content,
             }
         );
 
@@ -321,9 +411,9 @@ async fn execute_tool_call(
         let params = tc.parse_params::<WriteFileParams>()?;
         let filename = params.filename;
         let content = params.content;
-        let file = std::fs::File::open(&filename)?;
+        let file = std::fs::File::create(&filename)?;
         let mut writer = std::io::BufWriter::new(file);
-        writer.write(content.as_bytes())?;
+        writer.write_all(content.as_bytes())?;
 
         let writerresults = json!({
             "filename":filename
@@ -333,53 +423,31 @@ async fn execute_tool_call(
 
     if tc.is_tool::<EditFileParams>() {
         let params = tc.parse_params::<EditFileParams>()?;
-        return Ok("edit file activated".to_string());
+
+        let mut buf = std::fs::read_to_string(&params.filename)?;
+
+        if let Some(offset) = buf.find(&params.oldcontent) {
+            let end = offset + params.oldcontent.len();
+
+            buf.replace_range(offset..end, &params.newcontent);
+
+            std::fs::write(&params.filename, buf)?;
+
+            let editfileresults = json!({
+                "err" :"false",
+                "content" : "edit file activated"
+            });
+
+            return Ok(serde_json::to_string_pretty(&editfileresults)?);
+        } else {
+            let editfileresults = json!({
+                "err" :"true",
+                "content" : "Oldcontent not found"
+            });
+
+            return Ok(serde_json::to_string_pretty(&editfileresults)?);
+        }
     }
 
     Ok("unhandled tool:{tc.name()}".to_string())
 }
-// for step in 1..=MAX_AGENT_STEPS {
-//         let request = ChatCompletionRequest::builder()
-//             .model(model.clone())
-//             .messages(messages.clone())
-//             .typed_tool::<DeploymentStatusParams>()
-//             .typed_tool::<RunbookLookupParams>()
-//             .tool_choice_auto()
-//             .parallel_tool_calls(false)
-//             .max_tokens(700)
-//             .build()?;
-
-//         let response = client.chat().create(&request).await?;
-//         let Some(choice) = response.choices.first() else {
-//             println!("OpenRouter returned no choices");
-//             return Ok(());
-//         };
-
-//         if let Some(tool_calls) = choice.tool_calls() {
-//             println!("step {step}: executing {} tool call(s)", tool_calls.len());
-//             messages.push(Message::assistant_with_tool_calls(
-//                 choice.content().unwrap_or(""),
-//                 tool_calls.to_vec(),
-//             ));
-
-//             for tool_call in tool_calls {
-//                 let tool_result = execute_tool_call(tool_call)?;
-//                 println!("  {} -> {}", tool_call.name(), tool_result);
-//                 messages.push(Message::tool_response_named(
-//                     tool_call.id(),
-//                     tool_call.name(),
-//                     tool_result,
-//                 ));
-//             }
-
-//             continue;
-//         }
-
-//         println!("final answer:\n");
-//         println!("{}", choice.content().unwrap_or("(empty response)"));
-//         return Ok(());
-//     }
-
-//     println!("agent stopped after reaching the configured step limit");
-//     Ok(())
-// }
