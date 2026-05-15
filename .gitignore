@@ -3,6 +3,8 @@
 /target
 debug
 target
+.crust_sessions
+
 
 # Environment files
 .env

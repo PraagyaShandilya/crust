@@ -1,6 +1,7 @@
 mod session;
+
 use openrouter_rs::{
-    Content, OpenRouterClient,
+    Content,
     api::chat::Message,
     types::{Role, ToolCall, typed_tool::TypedTool},
 };
@@ -10,12 +11,25 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use session::SessionManager;
 use std::{
-    env,
     error::Error,
     io::{self, Read, Seek, SeekFrom, Write},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tavily::Tavily;
+
+use ratatui::{
+    Frame, Terminal,
+    backend::{Backend, CrosstermBackend},
+    crossterm::{
+        event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
+        execute,
+        terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    },
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    text::Line,
+    widgets::{Block, Borders, Paragraph, Wrap},
+};
 
 fn generate_landing_page() -> String {
     r#"
@@ -47,6 +61,81 @@ fn generate_landing_page() -> String {
     .to_string()
 }
 
+// setup for tui
+#[derive(Debug)]
+pub struct App {
+    system_message: &'static str,
+    sessionmanager: SessionManager,
+    inputstate: InputState,
+    agentstate: AgentState,
+    inputbuffer: String,
+    eventlog: Vec<String>,
+    cursor_visible: bool,
+    last_cursor_toggle: Instant,
+}
+
+#[derive(Debug, Default, PartialEq, Eq, Clone)]
+pub enum AgentState {
+    #[default]
+    Running,
+    Done,
+    Thinking,
+    Tool,
+}
+
+#[derive(Debug, Default, PartialEq, Eq, Clone)]
+pub enum InputState {
+    Settings,
+    #[default]
+    FieldInput,
+    Exit,
+}
+
+impl App {
+    pub fn new() -> Self {
+        // Initialize messages with system prompt
+        let system_message = r#"You are an AI agent given tools to be able to help people you can use the
+        bash tool to run unix commands in the shell, the read write and edit tools
+        respectively for editing files that you know the filenames of and the web search
+        tool to interface with the web."#;
+
+        // Initialize Session Manager
+        let mut session_manager = SessionManager::new();
+
+        let mut eventlog = Vec::new();
+        if session_manager.load_most_recent_session() {
+            let current_session = session_manager.get_current_session().unwrap();
+            eventlog.push(format!("Loaded session: {}", current_session.name));
+        } else {
+            let default_session =
+                session_manager.create_session("Default".to_string(), system_message);
+            eventlog.push(format!("Created session: {}", default_session.name));
+        }
+
+        Self {
+            system_message,
+            sessionmanager: session_manager,
+            inputstate: InputState::default(),
+            agentstate: AgentState::default(),
+            inputbuffer: "".to_string(),
+            eventlog,
+            cursor_visible: true,
+            last_cursor_toggle: Instant::now(),
+        }
+    }
+
+    pub fn get_sessionmanager(&self) -> SessionManager {
+        self.sessionmanager.clone()
+    }
+
+    pub fn get_inputstate(&self) -> InputState {
+        self.inputstate.clone()
+    }
+
+    pub fn get_agentstate(&self) -> AgentState {
+        self.agentstate.clone()
+    }
+}
 // tool setup for web search
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
 struct WebSearchParams {
@@ -133,189 +222,315 @@ impl TypedTool for EditFileParams {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    // Load .env from the current directory, falling back to the project root.
-    dotenvy::dotenv().ok();
-    dotenvy::from_filename(concat!(env!("CARGO_MANIFEST_DIR"), "/.env")).ok();
+    // setup terminal
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
 
-    let max_agent_steps = env::var("MAX_AGENT_STEPS")
-        .unwrap_or("5".to_string())
-        .parse::<u32>()?;
+    // create app and run it
+    let mut app = App::new();
+    let _ = run_app(&mut terminal, &mut app).await?;
 
-    let tavily_api_key = env::var("TAVILY_API_KEY").expect("TAVILY_API_KEY must be set");
+    // restore terminal
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    terminal.show_cursor()?;
 
-    let api_key = env::var("OPENROUTER_API_KEY").expect("OPENROUTER_API_KEY must be set");
+    Ok(())
+}
 
-    let client = OpenRouterClient::builder().api_key(api_key).build()?;
-
-    let modelname = env::var("OPENROUTER_MAIN_MODEL")
-        .unwrap_or_else(|_| "moonshotai/kimi-latest".to_string())
-        .to_string();
-
-    println!("Using OpenRouter model: {modelname}");
-
-    // Initialize messages with system prompt
-    let system_message = r#"You are an AI agent given tools to be able to help people you can use the
-        bash tool to run unix commands in the shell, the read write and edit tools
-        respectively for editing files that you know the filenames of and the web search
-        tool to interface with the web."#;
-
-    // Initialize Session Manager
-    let mut session_manager = SessionManager::new();
-    let default_session = session_manager.create_session("Default".to_string(), system_message);
-    println!("Created session: {}", default_session.name);
-
-    println!("{}", generate_landing_page());
-
+async fn run_app<B: Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+) -> Result<bool, Box<dyn Error>>
+where
+    B::Error: Error + 'static,
+{
     loop {
-        println!("\nEnter your prompt: \n");
-        let mut prompt = String::new();
+        if app.last_cursor_toggle.elapsed() >= Duration::from_millis(500) {
+            app.cursor_visible = !app.cursor_visible;
+            app.last_cursor_toggle = Instant::now();
+        }
 
-        io::stdin()
-            .read_line(&mut prompt)
-            .expect("Failed to capture prompt: \n");
+        terminal.draw(|f| ui(f, app))?;
 
-        let prompt_trimmed = prompt.trim();
-
-        // Session Management Commands
-        if prompt_trimmed.starts_with("/new ") {
-            let session_name = prompt_trimmed[5..].trim().to_string();
-            if session_name.is_empty() {
-                println!("Usage: /new <session_name>");
-                continue;
-            }
-            let new_session = session_manager.create_session(session_name, system_message);
-            println!("Created new session: {}", new_session.name);
+        if !event::poll(Duration::from_millis(100))? {
             continue;
         }
 
-        if prompt_trimmed == "/list" {
-            println!("\n--- Sessions ---");
-            for session in session_manager.list_sessions() {
-                let current_marker = if session_manager
-                    .get_current_session()
-                    .map_or(false, |s| s.id == session.id)
-                {
-                    " (current)"
-                } else {
-                    ""
-                };
-                println!(
-                    "ID: {} | Name: {} | Messages: {}{}",
-                    session.id,
-                    session.name,
-                    session.messages.len(),
-                    current_marker
-                );
-            }
-            println!("----------------");
+        let Event::Key(key) = event::read()? else {
             continue;
-        }
-
-        if prompt_trimmed.starts_with("/switch ") {
-            let session_id = prompt_trimmed[8..].trim();
-            match session_manager.switch_session(session_id) {
-                Ok(session) => println!("Switched to session: {}", session.name),
-                Err(e) => println!("Error: {}", e),
-            }
-            continue;
-        }
-
-        if prompt_trimmed == "/exit" {
-            println!("Crust agent quitting.....\n");
-            break;
-        }
-
-        // Add user message to session
-        let user_message = Message {
-            role: Role::User,
-            content: Content::Text(prompt),
-            tool_call_id: None,
-            name: None,
-            tool_calls: None,
         };
-        session_manager.add_message_to_current(user_message);
 
-        for _ in 0..max_agent_steps {
-            // Get current messages for API request
-            let current_messages = session_manager
-                .get_current_session()
-                .unwrap()
-                .messages
-                .clone();
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
 
-            let request = openrouter_rs::api::chat::ChatCompletionRequest::builder()
-                .model(&modelname)
-                .messages(current_messages.clone()) // Use cloned messages
-                .typed_tool::<WebSearchParams>()
-                .typed_tool::<BashParams>()
-                .typed_tool::<ReadFileParams>()
-                .typed_tool::<WriteFileParams>()
-                .typed_tool::<EditFileParams>()
-                .temperature(0.2f64)
-                .build()?;
+        match key.code {
+            KeyCode::Char(c) => {
+                app.inputbuffer.push(c);
+                app.cursor_visible = true;
+                app.last_cursor_toggle = Instant::now();
+            }
+            KeyCode::Backspace => {
+                app.inputbuffer.pop();
+                app.cursor_visible = true;
+                app.last_cursor_toggle = Instant::now();
+            }
+            KeyCode::Esc => break,
+            KeyCode::Enter => {
+                let prompt = app.inputbuffer.trim().to_string();
+                app.inputbuffer.clear();
+                app.cursor_visible = true;
+                app.last_cursor_toggle = Instant::now();
 
-            let response = match client.chat().create(&request).await {
-                Ok(response) => response,
-                Err(err) => {
-                    eprintln!("OpenRouter request failed for model `{modelname}`: {err:?}");
-                    return Err(Box::new(err) as Box<dyn Error>);
+                if prompt.is_empty() {
+                    continue;
                 }
-            };
+                if handle_session_command(app, &prompt) {
+                    if app.inputstate == InputState::Exit {
+                        break;
+                    }
+                    continue;
+                }
 
-            let Some(choice) = response.choices.first() else {
-                println!("\nCrust Agent: No Response quitting.........");
-                break;
-            };
+                app.agentstate = AgentState::Thinking;
+                terminal.draw(|f| ui(f, app))?;
 
-            if let Some(details) = choice.reasoning_details() {
-                for block in details {
-                    if let Some(text) = block.content() {
-                        println!("Thinking block [{}]:\n{}", block.reasoning_type(), text);
+                match agent_main_run(app, prompt).await {
+                    Ok(response) => {
+                        app.agentstate = AgentState::Done;
+                        app.eventlog.push(response);
+                    }
+                    Err(err) => {
+                        app.agentstate = AgentState::Done;
+                        app.eventlog.push(format!("Agent error: {err}"));
                     }
                 }
             }
-
-            if let Some(tool_calls) = choice.tool_calls() {
-                // Add assistant message with tool calls to session
-                session_manager.add_message_to_current(Message::assistant_with_tool_calls(
-                    choice.content().unwrap_or(""),
-                    tool_calls.to_vec(),
-                ));
-
-                for tool_call in tool_calls {
-                    let tool_result =
-                        execute_tool_call(tool_call, tavily_api_key.to_string()).await?;
-                    println!("tool call:  {} -> {}", tool_call.name(), tool_result);
-
-                    // Add tool response to session
-                    session_manager.add_message_to_current(Message::tool_response_named(
-                        tool_call.id(),
-                        tool_call.name(),
-                        tool_result,
-                    ));
-                }
-
-                continue;
-            } else {
-                println!(
-                    "{}Crust Agent:{}\n{}",
-                    ("=").repeat(50),
-                    ("=").repeat(50),
-                    choice.content().unwrap_or("")
-                );
-
-                // Add final assistant message to session
-                session_manager.add_message_to_current(Message::new(
-                    Role::Assistant,
-                    choice.content().unwrap_or(""),
-                ));
-
-                break;
-            }
+            _ => {}
         }
     }
+    Ok(false)
+}
 
-    Ok(())
+fn handle_session_command(app: &mut App, prompt: &str) -> bool {
+    if prompt == "/exit" {
+        app.inputstate = InputState::Exit;
+        app.eventlog.push("Crust agent quitting.....".to_string());
+        return true;
+    }
+
+    if prompt == "/new" || prompt.starts_with("/new ") {
+        let session_name = prompt.strip_prefix("/new").unwrap_or("").trim().to_string();
+        if session_name.is_empty() {
+            app.eventlog.push("Usage: /new <session_name>".to_string());
+            return true;
+        }
+        if app.sessionmanager.session_name_exists(&session_name) {
+            app.eventlog.push(format!(
+                "Error: session named '{session_name}' already exists"
+            ));
+            return true;
+        }
+        let new_session = app
+            .sessionmanager
+            .create_session(session_name, app.system_message);
+        app.eventlog.push(format!(
+            "Created and switched to new session: {} ({})",
+            new_session.name, new_session.id
+        ));
+        return true;
+    }
+
+    if prompt == "/list" {
+        app.eventlog.push("--- Sessions ---".to_string());
+        for session in app.sessionmanager.list_sessions() {
+            let current_marker = if app
+                .sessionmanager
+                .get_current_session()
+                .is_some_and(|s| s.id == session.id)
+            {
+                " (current)"
+            } else {
+                ""
+            };
+            app.eventlog.push(format!(
+                "ID: {} | Name: {} | Messages: {}{}",
+                session.id,
+                session.name,
+                session.messages.len(),
+                current_marker
+            ));
+        }
+        app.eventlog.push("----------------".to_string());
+        return true;
+    }
+
+    if let Some(session_name) = prompt.strip_prefix("/switch ") {
+        let session_name = session_name.trim();
+        match app.sessionmanager.find_session_id_by_name(session_name) {
+            Some(session_id) => match app.sessionmanager.switch_session(&session_id) {
+                Ok(session) => app
+                    .eventlog
+                    .push(format!("Switched to session: {}", session.name)),
+                Err(e) => app.eventlog.push(format!("Error: {e}")),
+            },
+            None => app
+                .eventlog
+                .push(format!("Error: session named '{session_name}' not found")),
+        }
+        return true;
+    }
+
+    false
+}
+
+fn ui(frame: &mut Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(5)])
+        .split(frame.area());
+
+    let mut lines: Vec<Line> = app
+        .eventlog
+        .iter()
+        .flat_map(|event| [Line::raw(event.clone()), Line::raw("")])
+        .collect();
+
+    if let Some(session) = app.sessionmanager.get_current_session() {
+        lines.push(Line::styled(
+            format!("Current session: {} ({})", session.name, session.id),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    let events_pane = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(format!(" Agent Events - {:?} ", app.agentstate))
+                .borders(Borders::ALL),
+        )
+        .wrap(Wrap { trim: false });
+
+    let cursor = if app.cursor_visible { "█" } else { " " };
+    let input_text = format!("{}{}", app.inputbuffer, cursor);
+    let input_pane = Paragraph::new(input_text)
+        .block(Block::default().title(" Input ").borders(Borders::ALL))
+        .style(Style::default().fg(Color::White))
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(events_pane, chunks[0]);
+    frame.render_widget(input_pane, chunks[1]);
+}
+
+async fn agent_main_run(app: &mut App, prompt: String) -> Result<String, Box<dyn Error>> {
+    // Add user message to session
+    let user_message = Message {
+        role: Role::User,
+        content: Content::Text(prompt),
+        tool_call_id: None,
+        name: None,
+        tool_calls: None,
+    };
+    app.sessionmanager.add_message_to_current(user_message);
+
+    let config = app.sessionmanager.get_current_config().unwrap();
+
+    for _ in 0..config.max_agent_steps {
+        // Get current messages for API request
+        let current_messages = app
+            .sessionmanager
+            .get_current_session()
+            .unwrap()
+            .messages
+            .clone();
+
+        let request = openrouter_rs::api::chat::ChatCompletionRequest::builder()
+            .model(&config.modelname)
+            .messages(current_messages.clone())
+            .typed_tools_batch(&[
+                WebSearchParams::create_tool(),
+                BashParams::create_tool(),
+                ReadFileParams::create_tool(),
+                EditFileParams::create_tool(),
+                WriteFileParams::create_tool(),
+            ])
+            .temperature(0.2f64)
+            .build()?;
+        let client = config.client_builder()?;
+        let response = match client.chat().create(&request).await {
+            Ok(response) => response,
+            Err(err) => {
+                let modelname = config.modelname;
+                app.eventlog
+                    .push(format!("OpenRouter request failed for model `{modelname}`: {err:?}"));
+                return Err(Box::new(err) as Box<dyn Error>);
+            }
+        };
+
+        let Some(choice) = response.choices.first() else {
+            app.eventlog
+                .push("Crust Agent: No Response quitting.........".to_string());
+            break;
+        };
+
+        if let Some(details) = choice.reasoning_details() {
+            for block in details {
+                if let Some(text) = block.content() {
+                    app.eventlog
+                        .push(format!("Thinking block [{}]:\n{}", block.reasoning_type(), text));
+                }
+            }
+        }
+
+        if let Some(tool_calls) = choice.tool_calls() {
+            // Add assistant message with tool calls to session
+            app.sessionmanager.add_message_to_current(Message::assistant_with_tool_calls(
+                choice.content().unwrap_or(""),
+                tool_calls.to_vec(),
+            ));
+
+            for tool_call in tool_calls {
+                let tool_result =
+                    execute_tool_call(tool_call, config.tavily_api_key.to_string()).await?;
+                app.eventlog
+                    .push(format!("tool call:  {} -> {}", tool_call.name(), tool_result));
+
+                // Add tool response to session
+                app.sessionmanager.add_message_to_current(Message::tool_response_named(
+                    tool_call.id(),
+                    tool_call.name(),
+                    tool_result,
+                ));
+            }
+
+            continue;
+        } else {
+            // Add final assistant message to session
+            app.sessionmanager.add_message_to_current(Message::new(
+                Role::Assistant,
+                choice.content().unwrap_or(""),
+            ));
+
+            return Ok(format!(
+                "{}Crust Agent:{}\n{}",
+                ("=").repeat(50),
+                ("=").repeat(50),
+                choice.content().unwrap_or("")
+            ));
+        }
+    }
+    Ok("".to_string())
 }
 
 async fn execute_tool_call(

@@ -1,45 +1,101 @@
-use openrouter_rs::{
-    Content, OpenRouterClient,
-    api::chat::Message,
-    types::{Role, ToolCall, typed_tool::TypedTool},
-};
+use openrouter_rs::{OpenRouterClient, api::chat::Message, types::Role};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::env;
+use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
 use uuid::Uuid;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Config {
+    pub max_agent_steps: u32,
+    pub tavily_api_key: String,
+    pub modelname: String,
+}
+
+impl Config {
+    pub fn new() -> Self {
+        // Load .env from the current directory, falling back to the project root.
+        dotenvy::dotenv().ok();
+        dotenvy::from_filename(concat!(env!("CARGO_MANIFEST_DIR"), "/.env")).ok();
+
+        let max_agent_steps = env::var("MAX_AGENT_STEPS")
+            .unwrap_or("10".to_string())
+            .parse::<u32>()
+            .expect("cant parse max agent steps val");
+
+        let tavily_api_key = env::var("TAVILY_API_KEY").expect("TAVILY_API_KEY must be set");
+
+        let modelname = env::var("OPENROUTER_MAIN_MODEL")
+            .unwrap_or_else(|_| "moonshotai/kimi-latest".to_string())
+            .to_string();
+
+        Config {
+            max_agent_steps,
+            tavily_api_key,
+            modelname,
+        }
+    }
+
+    pub fn client_builder(&self) -> Result<OpenRouterClient, Box<dyn Error>> {
+        let api_key = env::var("OPENROUTER_API_KEY").expect("OPENROUTER_API_KEY must be set");
+        let client = OpenRouterClient::builder()
+            .api_key(api_key.clone())
+            .build()
+            .expect("Openrouter API Key not valid");
+        Ok(client)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
     pub name: String,
     pub created_at: String,
+    #[serde(default)]
+    pub edited_at: String,
     pub messages: Vec<Message>,
     pub sysprompt: Message,
+    pub config: Config,
 }
 
 impl Session {
     pub fn new(name: String, sysprompt: &str) -> Self {
         let sysprompt: Message = Message::new(Role::System, sysprompt);
         let messages = vec![sysprompt.clone()];
+        let now = chrono::Utc::now().to_rfc3339();
+        let config = Config::new();
         Self {
             id: Uuid::new_v4().to_string(),
             name,
-            created_at: chrono::Utc::now().to_rfc3339(),
-            messages: messages,
-            sysprompt: sysprompt,
+            created_at: now.clone(),
+            edited_at: now,
+            messages,
+            sysprompt,
+            config,
         }
+    }
+
+    pub fn touch(&mut self) {
+        self.edited_at = chrono::Utc::now().to_rfc3339();
     }
 
     pub fn add_message(&mut self, message: Message) {
         self.messages.push(message);
+        self.touch();
     }
 
     pub fn clear_messages(&mut self) {
         self.messages.clear();
+        self.messages.push(self.sysprompt.clone());
+        self.touch();
+    }
+    pub fn get_config(&self) -> Config {
+        self.config.clone()
     }
 }
-
+#[derive(Debug, Default, Clone)]
 pub struct SessionManager {
     sessions: HashMap<String, Session>,
     current_session_id: Option<String>,
@@ -64,11 +120,20 @@ impl SessionManager {
         }
     }
 
+    pub fn session_name_exists(&self, session_name: &str) -> bool {
+        self.sessions
+            .values()
+            .any(|session| session.name == session_name)
+    }
+
     pub fn create_session(&mut self, name: String, sysprompt: &str) -> &Session {
         let session = Session::new(name, sysprompt);
         let id = session.id.clone();
         self.sessions.insert(id.clone(), session);
-        self.current_session_id = Some(id);
+        self.current_session_id = Some(id.clone());
+        if let Some(session) = self.sessions.get_mut(&id) {
+            session.touch();
+        }
         self.save_sessions();
 
         self.get_current_session().unwrap()
@@ -78,9 +143,17 @@ impl SessionManager {
         self.sessions.values().collect()
     }
 
+    pub fn find_session_id_by_name(&self, session_name: &str) -> Option<String> {
+        self.sessions
+            .values()
+            .find(|session| session.name == session_name)
+            .map(|session| session.id.clone())
+    }
+
     pub fn switch_session(&mut self, session_id: &str) -> Result<&Session, String> {
         if self.sessions.contains_key(session_id) {
             self.current_session_id = Some(session_id.to_string());
+            self.save_sessions();
             Ok(self.get_current_session().unwrap())
         } else {
             Err(format!("Session '{}' not found", session_id))
@@ -88,12 +161,20 @@ impl SessionManager {
     }
 
     pub fn delete_session(&mut self, session_id: &str) -> Result<(), String> {
+        if !self.sessions.contains_key(session_id) {
+            return Err(format!("Session '{}' not found", session_id));
+        }
+
         if let Some(current) = &self.current_session_id {
             if current == session_id {
                 self.current_session_id = None;
             }
         }
+
         self.sessions.remove(session_id);
+        if self.current_session_id.is_none() {
+            self.current_session_id = self.sessions.keys().next().cloned();
+        }
         self.save_sessions();
         Ok(())
     }
@@ -113,12 +194,22 @@ impl SessionManager {
     pub fn add_message_to_current(&mut self, message: Message) {
         if let Some(session) = self.get_current_session_mut() {
             session.add_message(message);
+            self.save_sessions();
+        }
+    }
+
+    pub fn get_current_config(&self) -> Option<Config> {
+        if let Some(session) = self.get_current_session() {
+            return Some(session.get_config());
+        } else {
+            return None;
         }
     }
 
     pub fn clear_current_session(&mut self) {
         if let Some(session) = self.get_current_session_mut() {
             session.clear_messages();
+            self.save_sessions();
         }
     }
 
@@ -133,22 +224,40 @@ impl SessionManager {
         }
     }
 
-    fn load_sessions(&mut self) {
+    pub fn load_most_recent_session(&mut self) -> bool {
         let sessions_file = self.storage_path.join("sessions.json");
 
-        if sessions_file.exists() {
-            if let Ok(data) = fs::read_to_string(&sessions_file) {
-                if let Ok(sessions) = serde_json::from_str::<Vec<Session>>(&data) {
-                    for session in sessions.clone() {
-                        self.sessions.insert(session.id.clone(), session);
-                    }
-                    // Restore current session if it exists
-                    if let Some(first_session) = sessions.first() {
-                        self.current_session_id = Some(first_session.id.clone());
-                    }
-                }
-            }
+        if !sessions_file.exists() {
+            return false;
         }
+
+        let Ok(data) = fs::read_to_string(&sessions_file) else {
+            return false;
+        };
+
+        let Ok(sessions) = serde_json::from_str::<Vec<Session>>(&data) else {
+            return false;
+        };
+
+        if sessions.is_empty() {
+            return false;
+        }
+
+        self.sessions.clear();
+        for mut session in sessions {
+            if session.edited_at.is_empty() {
+                session.edited_at = session.created_at.clone();
+            }
+            self.sessions.insert(session.id.clone(), session);
+        }
+
+        self.current_session_id = self
+            .sessions
+            .values()
+            .max_by(|a, b| a.edited_at.cmp(&b.edited_at))
+            .map(|session| session.id.clone());
+
+        self.current_session_id.is_some()
     }
 }
 
