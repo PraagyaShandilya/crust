@@ -10,7 +10,6 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub max_agent_steps: u32,
-    pub tavily_api_key: String,
     pub modelname: String,
 }
 
@@ -25,15 +24,12 @@ impl Config {
             .parse::<u32>()
             .expect("cant parse max agent steps val");
 
-        let tavily_api_key = env::var("TAVILY_API_KEY").expect("TAVILY_API_KEY must be set");
-
         let modelname = env::var("OPENROUTER_MAIN_MODEL")
             .unwrap_or_else(|_| "moonshotai/kimi-latest".to_string())
             .to_string();
 
         Config {
             max_agent_steps,
-            tavily_api_key,
             modelname,
         }
     }
@@ -141,6 +137,13 @@ impl SessionManager {
 
     pub fn list_sessions(&self) -> Vec<&Session> {
         self.sessions.values().collect()
+    }
+
+    pub fn list_session_names(&self) -> Vec<&str> {
+        self.sessions
+            .values()
+            .map(|session| session.name.as_str())
+            .collect()
     }
 
     pub fn find_session_id_by_name(&self, session_name: &str) -> Option<String> {

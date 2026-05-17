@@ -26,40 +26,10 @@ use ratatui::{
         terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
     },
     layout::{Constraint, Direction, Layout},
-    style::{Color, Modifier, Style},
+    style::{Color, Style},
     text::Line,
     widgets::{Block, Borders, Paragraph, Wrap},
 };
-
-fn generate_landing_page() -> String {
-    r#"
-        ▒▒          ▒▒                                ▒▒          ▒▒
-        ▒▒          ▒▒                                ▒▒          ▒▒
-      ▒▒▒▒▒▒      ▒▒▒▒▒▒                            ▒▒▒▒▒▒      ▒▒▒▒▒▒
-      ▒▒▒▒▒▒▒▒  ▒▒▒▒▒▒▒▒                            ▒▒▒▒▒▒▒▒  ▒▒▒▒▒▒▒▒
-      ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒                            ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
-        ▒▒▒▒▒▒▒▒▒▒▒▒▒▒        ████        ████        ▒▒▒▒▒▒▒▒▒▒▒▒▒▒
-        ▒▒▒▒▒▒▒▒▒▒▒▒▒▒        ████        ████        ▒▒▒▒▒▒▒▒▒▒▒▒▒▒
-          ▒▒▒▒▒▒▒▒▒▒                                    ▒▒▒▒▒▒▒▒▒▒
-            ▒▒▒▒▒▒            ▒▒▒▒        ▒▒▒▒            ▒▒▒▒▒▒
-            ▒▒▒▒▒▒            ▒▒▒▒        ▒▒▒▒            ▒▒▒▒▒▒
-            ▒▒▒▒▒▒        ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒        ▒▒▒▒▒▒
-            ▒▒▒▒▒▒▒▒    ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒    ▒▒▒▒▒▒▒▒
-              ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
-            ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒
-          ▒▒▒▒    ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒    ▒▒▒▒
-        ▒▒▒▒        ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒        ▒▒▒▒
-        ▒▒▒▒        ▒▒▒▒    ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒    ▒▒▒▒        ▒▒▒▒
-        ▒▒▒▒      ▒▒▒▒                                ▒▒▒▒      ▒▒▒▒
-          ▒▒      ▒▒▒▒                                ▒▒▒▒      ▒▒
-          ▒▒      ▒▒▒▒                                ▒▒▒▒      ▒▒
-          ░░        ▒▒                                ▒▒░░
-                    ▒▒                                ▒▒
-                    WELCOME TO THE CRUST CODING ASSISTANT
-
-    "#
-    .to_string()
-}
 
 // setup for tui
 #[derive(Debug)]
@@ -70,6 +40,8 @@ pub struct App {
     agentstate: AgentState,
     inputbuffer: String,
     eventlog: Vec<String>,
+    event_scroll: usize,
+    event_max_scroll: usize,
     cursor_visible: bool,
     last_cursor_toggle: Instant,
 }
@@ -119,6 +91,8 @@ impl App {
             agentstate: AgentState::default(),
             inputbuffer: "".to_string(),
             eventlog,
+            event_scroll: 0,
+            event_max_scroll: 0,
             cursor_visible: true,
             last_cursor_toggle: Instant::now(),
         }
@@ -284,6 +258,30 @@ where
                 app.cursor_visible = true;
                 app.last_cursor_toggle = Instant::now();
             }
+            KeyCode::Up => {
+                app.event_scroll = app.event_scroll.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                app.event_scroll = app
+                    .event_scroll
+                    .saturating_add(1)
+                    .min(app.event_max_scroll);
+            }
+            KeyCode::PageUp => {
+                app.event_scroll = app.event_scroll.saturating_sub(10);
+            }
+            KeyCode::PageDown => {
+                app.event_scroll = app
+                    .event_scroll
+                    .saturating_add(10)
+                    .min(app.event_max_scroll);
+            }
+            KeyCode::Home => {
+                app.event_scroll = 0;
+            }
+            KeyCode::End => {
+                app.event_scroll = app.event_max_scroll;
+            }
             KeyCode::Esc => break,
             KeyCode::Enter => {
                 let prompt = app.inputbuffer.trim().to_string();
@@ -300,7 +298,8 @@ where
                     }
                     continue;
                 }
-
+                app.eventlog.push(format!("User: {}\n", prompt.clone()));
+                app.event_scroll = 0;
                 app.agentstate = AgentState::Thinking;
                 terminal.draw(|f| ui(f, app))?;
 
@@ -308,10 +307,12 @@ where
                     Ok(response) => {
                         app.agentstate = AgentState::Done;
                         app.eventlog.push(response);
+                        app.event_scroll = 0;
                     }
                     Err(err) => {
                         app.agentstate = AgentState::Done;
                         app.eventlog.push(format!("Agent error: {err}"));
+                        app.event_scroll = 0;
                     }
                 }
             }
@@ -393,40 +394,54 @@ fn handle_session_command(app: &mut App, prompt: &str) -> bool {
     false
 }
 
-fn ui(frame: &mut Frame, app: &App) {
+fn ui(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(3), Constraint::Length(5)])
         .split(frame.area());
 
-    let mut lines: Vec<Line> = app
+    let lines: Vec<Line> = app
         .eventlog
         .iter()
-        .flat_map(|event| [Line::raw(event.clone()), Line::raw("")])
+        .flat_map(|event| {
+            event
+                .lines()
+                .map(|line| Line::raw(line.to_string()))
+                .chain(std::iter::once(Line::raw("")))
+        })
         .collect();
 
-    if let Some(session) = app.sessionmanager.get_current_session() {
-        lines.push(Line::styled(
-            format!("Current session: {} ({})", session.name, session.id),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
+    let events_view_height = usize::from(chunks[0].height.saturating_sub(2));
+    let events_view_width = usize::from(chunks[0].width.saturating_sub(2)).max(1);
+    let rendered_height: usize = lines
+        .iter()
+        .map(|line| line.width().div_ceil(events_view_width).max(1))
+        .sum();
+    let max_scroll = rendered_height.saturating_sub(events_view_height);
+    let scroll_growth = max_scroll.saturating_sub(app.event_max_scroll);
+    app.event_scroll = app
+        .event_scroll
+        .saturating_add(scroll_growth)
+        .min(max_scroll);
+    app.event_max_scroll = max_scroll;
+    let event_scroll = app.event_scroll.min(usize::from(u16::MAX)) as u16;
 
+    let session = app.sessionmanager.get_current_session().unwrap();
+    let title: String = format!("{} - {}", session.name, session.id);
     let events_pane = Paragraph::new(lines)
         .block(
             Block::default()
                 .title(format!(" Agent Events - {:?} ", app.agentstate))
                 .borders(Borders::ALL),
         )
+        .scroll((event_scroll, 0))
         .wrap(Wrap { trim: false });
 
     let cursor = if app.cursor_visible { "█" } else { " " };
     let input_text = format!("{}{}", app.inputbuffer, cursor);
     let input_pane = Paragraph::new(input_text)
-        .block(Block::default().title(" Input ").borders(Borders::ALL))
-        .style(Style::default().fg(Color::White))
+        .block(Block::default().title(title).borders(Borders::ALL))
+        .style(Style::default().fg(Color::LightYellow))
         .wrap(Wrap { trim: false });
 
     frame.render_widget(events_pane, chunks[0]);
@@ -472,8 +487,9 @@ async fn agent_main_run(app: &mut App, prompt: String) -> Result<String, Box<dyn
             Ok(response) => response,
             Err(err) => {
                 let modelname = config.modelname;
-                app.eventlog
-                    .push(format!("OpenRouter request failed for model `{modelname}`: {err:?}"));
+                app.eventlog.push(format!(
+                    "OpenRouter request failed for model `{modelname}`: {err:?}"
+                ));
                 return Err(Box::new(err) as Box<dyn Error>);
             }
         };
@@ -487,31 +503,38 @@ async fn agent_main_run(app: &mut App, prompt: String) -> Result<String, Box<dyn
         if let Some(details) = choice.reasoning_details() {
             for block in details {
                 if let Some(text) = block.content() {
-                    app.eventlog
-                        .push(format!("Thinking block [{}]:\n{}", block.reasoning_type(), text));
+                    app.eventlog.push(format!(
+                        "Thinking block [{}]:\n{}",
+                        block.reasoning_type(),
+                        text
+                    ));
                 }
             }
         }
 
         if let Some(tool_calls) = choice.tool_calls() {
             // Add assistant message with tool calls to session
-            app.sessionmanager.add_message_to_current(Message::assistant_with_tool_calls(
-                choice.content().unwrap_or(""),
-                tool_calls.to_vec(),
-            ));
+            app.sessionmanager
+                .add_message_to_current(Message::assistant_with_tool_calls(
+                    choice.content().unwrap_or(""),
+                    tool_calls.to_vec(),
+                ));
 
             for tool_call in tool_calls {
-                let tool_result =
-                    execute_tool_call(tool_call, config.tavily_api_key.to_string()).await?;
-                app.eventlog
-                    .push(format!("tool call:  {} -> {}", tool_call.name(), tool_result));
+                let tool_result = execute_tool_call(tool_call).await?;
+                app.eventlog.push(format!(
+                    "tool call:  {} -> {}",
+                    tool_call.name(),
+                    tool_result
+                ));
 
                 // Add tool response to session
-                app.sessionmanager.add_message_to_current(Message::tool_response_named(
-                    tool_call.id(),
-                    tool_call.name(),
-                    tool_result,
-                ));
+                app.sessionmanager
+                    .add_message_to_current(Message::tool_response_named(
+                        tool_call.id(),
+                        tool_call.name(),
+                        tool_result,
+                    ));
             }
 
             continue;
@@ -530,17 +553,17 @@ async fn agent_main_run(app: &mut App, prompt: String) -> Result<String, Box<dyn
             ));
         }
     }
-    Ok("".to_string())
+    Ok("Agent reached max steps without producing a final response.".to_string())
 }
 
-async fn execute_tool_call(
-    tc: &ToolCall,
-    tavily_api_key: String,
-) -> Result<String, Box<dyn Error>> {
+async fn execute_tool_call(tc: &ToolCall) -> Result<String, Box<dyn Error>> {
     //Web Search tool exec
 
     if tc.is_tool::<WebSearchParams>() {
         let params = tc.parse_params::<WebSearchParams>()?;
+        dotenvy::dotenv().ok();
+        dotenvy::from_filename(concat!(env!("CARGO_MANIFEST_DIR"), "/.env")).ok();
+        let tavily_api_key = std::env::var("TAVILY_API_KEY")?;
         let tavily = Tavily::builder(tavily_api_key)
             .timeout(Duration::from_secs(45))
             .max_retries(5)
