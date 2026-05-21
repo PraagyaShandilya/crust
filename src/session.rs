@@ -34,7 +34,7 @@ impl Config {
         }
     }
 
-    pub fn client_builder(&self) -> Result<OpenRouterClient, Box<dyn Error>> {
+    pub fn client_builder(&self) -> Result<OpenRouterClient, Box<dyn Error + Send + Sync>> {
         let api_key = env::var("OPENROUTER_API_KEY").expect("OPENROUTER_API_KEY must be set");
         let client = OpenRouterClient::builder()
             .api_key(api_key.clone())

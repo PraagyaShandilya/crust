@@ -13,9 +13,12 @@ use session::SessionManager;
 use std::{
     error::Error,
     io::{self, Read, Seek, SeekFrom, Write},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tavily::Tavily;
+use tokio::sync::{Mutex, mpsc};
+use tokio::task::JoinHandle;
 
 use ratatui::{
     Frame, Terminal,
@@ -35,15 +38,17 @@ use ratatui::{
 #[derive(Debug)]
 pub struct App {
     system_message: &'static str,
-    sessionmanager: SessionManager,
+    sessionmanager: Arc<Mutex<SessionManager>>,
+    current_session_title: String,
     inputstate: InputState,
     agentstate: AgentState,
     inputbuffer: String,
-    eventlog: Vec<String>,
+    eventlog: Vec<LogEntry>,
     event_scroll: usize,
     event_max_scroll: usize,
     cursor_visible: bool,
     last_cursor_toggle: Instant,
+    agent_task: Option<JoinHandle<()>>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq, Clone)]
@@ -53,6 +58,29 @@ pub enum AgentState {
     Done,
     Thinking,
     Tool,
+}
+
+#[derive(Debug, Clone)]
+pub enum AgentEvent {
+    UserSubmitted { prompt: String },
+    Thinking { kind: String, text: String },
+    ToolCallStarted { name: String, args: String },
+    ToolCallFinished { name: String, result: String },
+    AssistantFinal { text: String },
+    Error { message: String },
+    MaxStepsReached,
+    Finished,
+}
+
+#[derive(Debug, Clone)]
+pub enum LogEntry {
+    User(String),
+    Assistant(String),
+    Thinking { kind: String, text: String },
+    ToolCall { name: String, args: String },
+    ToolResult { name: String, result: String },
+    System(String),
+    Error(String),
 }
 
 #[derive(Debug, Default, PartialEq, Eq, Clone)]
@@ -75,18 +103,28 @@ impl App {
         let mut session_manager = SessionManager::new();
 
         let mut eventlog = Vec::new();
+        let current_session_title;
         if session_manager.load_most_recent_session() {
             let current_session = session_manager.get_current_session().unwrap();
-            eventlog.push(format!("Loaded session: {}", current_session.name));
+            current_session_title = format!("{} - {}", current_session.name, current_session.id);
+            eventlog.push(LogEntry::System(format!(
+                "Loaded session: {}",
+                current_session.name
+            )));
         } else {
             let default_session =
                 session_manager.create_session("Default".to_string(), system_message);
-            eventlog.push(format!("Created session: {}", default_session.name));
+            current_session_title = format!("{} - {}", default_session.name, default_session.id);
+            eventlog.push(LogEntry::System(format!(
+                "Created session: {}",
+                default_session.name
+            )));
         }
 
         Self {
             system_message,
-            sessionmanager: session_manager,
+            sessionmanager: Arc::new(Mutex::new(session_manager)),
+            current_session_title,
             inputstate: InputState::default(),
             agentstate: AgentState::default(),
             inputbuffer: "".to_string(),
@@ -95,11 +133,8 @@ impl App {
             event_max_scroll: 0,
             cursor_visible: true,
             last_cursor_toggle: Instant::now(),
+            agent_task: None,
         }
-    }
-
-    pub fn get_sessionmanager(&self) -> SessionManager {
-        self.sessionmanager.clone()
     }
 
     pub fn get_inputstate(&self) -> InputState {
@@ -108,6 +143,45 @@ impl App {
 
     pub fn get_agentstate(&self) -> AgentState {
         self.agentstate.clone()
+    }
+
+    pub fn handle_agent_event(&mut self, event: AgentEvent) {
+        match event {
+            AgentEvent::UserSubmitted { prompt } => {
+                self.eventlog.push(LogEntry::User(prompt));
+                self.agentstate = AgentState::Thinking;
+            }
+            AgentEvent::Thinking { kind, text } => {
+                self.eventlog.push(LogEntry::Thinking { kind, text });
+                self.agentstate = AgentState::Thinking;
+            }
+            AgentEvent::ToolCallStarted { name, args } => {
+                self.eventlog.push(LogEntry::ToolCall { name, args });
+                self.agentstate = AgentState::Tool;
+            }
+            AgentEvent::ToolCallFinished { name, result } => {
+                self.eventlog.push(LogEntry::ToolResult { name, result });
+                self.agentstate = AgentState::Tool;
+            }
+            AgentEvent::AssistantFinal { text } => {
+                self.eventlog.push(LogEntry::Assistant(text));
+                self.agentstate = AgentState::Done;
+            }
+            AgentEvent::Error { message } => {
+                self.eventlog.push(LogEntry::Error(message));
+                self.agentstate = AgentState::Done;
+            }
+            AgentEvent::MaxStepsReached => {
+                self.eventlog.push(LogEntry::Error(
+                    "Agent reached max steps without producing a final response.".to_string(),
+                ));
+                self.agentstate = AgentState::Done;
+            }
+            AgentEvent::Finished => {
+                self.agent_task = None;
+                self.agentstate = AgentState::Done;
+            }
+        }
     }
 }
 // tool setup for web search
@@ -227,7 +301,13 @@ async fn run_app<B: Backend>(
 where
     B::Error: Error + 'static,
 {
+    let (agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(100);
+
     loop {
+        while let Ok(event) = agent_rx.try_recv() {
+            app.handle_agent_event(event);
+        }
+
         if app.last_cursor_toggle.elapsed() >= Duration::from_millis(500) {
             app.cursor_visible = !app.cursor_visible;
             app.last_cursor_toggle = Instant::now();
@@ -262,10 +342,7 @@ where
                 app.event_scroll = app.event_scroll.saturating_sub(1);
             }
             KeyCode::Down => {
-                app.event_scroll = app
-                    .event_scroll
-                    .saturating_add(1)
-                    .min(app.event_max_scroll);
+                app.event_scroll = app.event_scroll.saturating_add(1).min(app.event_max_scroll);
             }
             KeyCode::PageUp => {
                 app.event_scroll = app.event_scroll.saturating_sub(10);
@@ -282,7 +359,16 @@ where
             KeyCode::End => {
                 app.event_scroll = app.event_max_scroll;
             }
-            KeyCode::Esc => break,
+            KeyCode::Esc => {
+                if let Some(task) = app.agent_task.take() {
+                    task.abort();
+                    app.handle_agent_event(AgentEvent::Error {
+                        message: "Agent run cancelled by user.".to_string(),
+                    });
+                } else {
+                    break;
+                }
+            }
             KeyCode::Enter => {
                 let prompt = app.inputbuffer.trim().to_string();
                 app.inputbuffer.clear();
@@ -292,29 +378,37 @@ where
                 if prompt.is_empty() {
                     continue;
                 }
-                if handle_session_command(app, &prompt) {
+                if handle_session_command(app, &prompt).await {
                     if app.inputstate == InputState::Exit {
                         break;
                     }
                     continue;
                 }
-                app.eventlog.push(format!("User: {}\n", prompt.clone()));
-                app.event_scroll = 0;
-                app.agentstate = AgentState::Thinking;
+
+                if app.agent_task.is_some() {
+                    app.handle_agent_event(AgentEvent::Error {
+                        message: "Agent is already running.".to_string(),
+                    });
+                    continue;
+                }
+
+                app.handle_agent_event(AgentEvent::UserSubmitted {
+                    prompt: prompt.clone(),
+                });
                 terminal.draw(|f| ui(f, app))?;
 
-                match agent_main_run(app, prompt).await {
-                    Ok(response) => {
-                        app.agentstate = AgentState::Done;
-                        app.eventlog.push(response);
-                        app.event_scroll = 0;
+                let sessionmanager = Arc::clone(&app.sessionmanager);
+                let tx = agent_tx.clone();
+                app.agent_task = Some(tokio::spawn(async move {
+                    if let Err(err) = agent_main_run(sessionmanager, prompt, tx.clone()).await {
+                        let _ = tx
+                            .send(AgentEvent::Error {
+                                message: err.to_string(),
+                            })
+                            .await;
                     }
-                    Err(err) => {
-                        app.agentstate = AgentState::Done;
-                        app.eventlog.push(format!("Agent error: {err}"));
-                        app.event_scroll = 0;
-                    }
-                }
+                    let _ = tx.send(AgentEvent::Finished).await;
+                }));
             }
             _ => {}
         }
@@ -322,40 +416,44 @@ where
     Ok(false)
 }
 
-fn handle_session_command(app: &mut App, prompt: &str) -> bool {
+async fn handle_session_command(app: &mut App, prompt: &str) -> bool {
     if prompt == "/exit" {
         app.inputstate = InputState::Exit;
-        app.eventlog.push("Crust agent quitting.....".to_string());
+        app.eventlog
+            .push(LogEntry::System("Crust agent quitting.....".to_string()));
         return true;
     }
 
     if prompt == "/new" || prompt.starts_with("/new ") {
         let session_name = prompt.strip_prefix("/new").unwrap_or("").trim().to_string();
         if session_name.is_empty() {
-            app.eventlog.push("Usage: /new <session_name>".to_string());
+            app.eventlog
+                .push(LogEntry::Error("Usage: /new <session_name>".to_string()));
             return true;
         }
-        if app.sessionmanager.session_name_exists(&session_name) {
-            app.eventlog.push(format!(
+
+        let mut sessionmanager = app.sessionmanager.lock().await;
+        if sessionmanager.session_name_exists(&session_name) {
+            app.eventlog.push(LogEntry::Error(format!(
                 "Error: session named '{session_name}' already exists"
-            ));
+            )));
             return true;
         }
-        let new_session = app
-            .sessionmanager
-            .create_session(session_name, app.system_message);
-        app.eventlog.push(format!(
+        let new_session = sessionmanager.create_session(session_name, app.system_message);
+        app.current_session_title = format!("{} - {}", new_session.name, new_session.id);
+        app.eventlog.push(LogEntry::System(format!(
             "Created and switched to new session: {} ({})",
             new_session.name, new_session.id
-        ));
+        )));
         return true;
     }
 
     if prompt == "/list" {
-        app.eventlog.push("--- Sessions ---".to_string());
-        for session in app.sessionmanager.list_sessions() {
-            let current_marker = if app
-                .sessionmanager
+        app.eventlog
+            .push(LogEntry::System("--- Sessions ---".to_string()));
+        let sessionmanager = app.sessionmanager.lock().await;
+        for session in sessionmanager.list_sessions() {
+            let current_marker = if sessionmanager
                 .get_current_session()
                 .is_some_and(|s| s.id == session.id)
             {
@@ -363,30 +461,36 @@ fn handle_session_command(app: &mut App, prompt: &str) -> bool {
             } else {
                 ""
             };
-            app.eventlog.push(format!(
+            app.eventlog.push(LogEntry::System(format!(
                 "ID: {} | Name: {} | Messages: {}{}",
                 session.id,
                 session.name,
                 session.messages.len(),
                 current_marker
-            ));
+            )));
         }
-        app.eventlog.push("----------------".to_string());
+        app.eventlog
+            .push(LogEntry::System("----------------".to_string()));
         return true;
     }
 
     if let Some(session_name) = prompt.strip_prefix("/switch ") {
         let session_name = session_name.trim();
-        match app.sessionmanager.find_session_id_by_name(session_name) {
-            Some(session_id) => match app.sessionmanager.switch_session(&session_id) {
-                Ok(session) => app
-                    .eventlog
-                    .push(format!("Switched to session: {}", session.name)),
-                Err(e) => app.eventlog.push(format!("Error: {e}")),
+        let mut sessionmanager = app.sessionmanager.lock().await;
+        match sessionmanager.find_session_id_by_name(session_name) {
+            Some(session_id) => match sessionmanager.switch_session(&session_id) {
+                Ok(session) => {
+                    app.current_session_title = format!("{} - {}", session.name, session.id);
+                    app.eventlog.push(LogEntry::System(format!(
+                        "Switched to session: {}",
+                        session.name
+                    )));
+                }
+                Err(e) => app.eventlog.push(LogEntry::Error(format!("Error: {e}"))),
             },
-            None => app
-                .eventlog
-                .push(format!("Error: session named '{session_name}' not found")),
+            None => app.eventlog.push(LogEntry::Error(format!(
+                "Error: session named '{session_name}' not found"
+            ))),
         }
         return true;
     }
@@ -400,16 +504,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
         .constraints([Constraint::Min(3), Constraint::Length(5)])
         .split(frame.area());
 
-    let lines: Vec<Line> = app
-        .eventlog
-        .iter()
-        .flat_map(|event| {
-            event
-                .lines()
-                .map(|line| Line::raw(line.to_string()))
-                .chain(std::iter::once(Line::raw("")))
-        })
-        .collect();
+    let lines: Vec<Line> = app.eventlog.iter().flat_map(log_entry_to_lines).collect();
 
     let events_view_height = usize::from(chunks[0].height.saturating_sub(2));
     let events_view_width = usize::from(chunks[0].width.saturating_sub(2)).max(1);
@@ -426,8 +521,6 @@ fn ui(frame: &mut Frame, app: &mut App) {
     app.event_max_scroll = max_scroll;
     let event_scroll = app.event_scroll.min(usize::from(u16::MAX)) as u16;
 
-    let session = app.sessionmanager.get_current_session().unwrap();
-    let title: String = format!("{} - {}", session.name, session.id);
     let events_pane = Paragraph::new(lines)
         .block(
             Block::default()
@@ -440,7 +533,11 @@ fn ui(frame: &mut Frame, app: &mut App) {
     let cursor = if app.cursor_visible { "█" } else { " " };
     let input_text = format!("{}{}", app.inputbuffer, cursor);
     let input_pane = Paragraph::new(input_text)
-        .block(Block::default().title(title).borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title(app.current_session_title.as_str())
+                .borders(Borders::ALL),
+        )
         .style(Style::default().fg(Color::LightYellow))
         .wrap(Wrap { trim: false });
 
@@ -448,8 +545,64 @@ fn ui(frame: &mut Frame, app: &mut App) {
     frame.render_widget(input_pane, chunks[1]);
 }
 
-async fn agent_main_run(app: &mut App, prompt: String) -> Result<String, Box<dyn Error>> {
-    // Add user message to session
+fn push_log_lines(lines: &mut Vec<Line<'static>>, style: Style, text: String) {
+    for line in text.lines() {
+        lines.push(Line::styled(line.to_string(), style));
+    }
+    lines.push(Line::raw(""));
+}
+
+fn log_entry_to_lines(entry: &LogEntry) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    match entry {
+        LogEntry::User(text) => push_log_lines(
+            &mut lines,
+            Style::default().fg(Color::Cyan),
+            format!("User: {text}"),
+        ),
+        LogEntry::Assistant(text) => push_log_lines(
+            &mut lines,
+            Style::default().fg(Color::White),
+            format!(
+                "{}Crust Agent:{}\n{}\n{}",
+                "=".repeat(50),
+                "=".repeat(50),
+                text,
+                "=".repeat(175),
+            ),
+        ),
+        LogEntry::Thinking { kind, text } => push_log_lines(
+            &mut lines,
+            Style::default().fg(Color::DarkGray),
+            format!("Thinking block [{kind}]:\n{text}"),
+        ),
+        LogEntry::ToolCall { name, args } => push_log_lines(
+            &mut lines,
+            Style::default().fg(Color::Yellow),
+            format!("tool call started: {name}\n{args}"),
+        ),
+        LogEntry::ToolResult { name, result } => push_log_lines(
+            &mut lines,
+            Style::default().fg(Color::Green),
+            format!("tool call: {name} -> {result}"),
+        ),
+        LogEntry::System(text) => push_log_lines(
+            &mut lines,
+            Style::default().fg(Color::LightBlue),
+            text.clone(),
+        ),
+        LogEntry::Error(text) => {
+            push_log_lines(&mut lines, Style::default().fg(Color::Red), text.clone())
+        }
+    }
+    lines
+}
+
+async fn agent_main_run(
+    sessionmanager: Arc<Mutex<SessionManager>>,
+    prompt: String,
+    event_tx: mpsc::Sender<AgentEvent>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let user_message = Message {
         role: Role::User,
         content: Content::Text(prompt),
@@ -457,18 +610,21 @@ async fn agent_main_run(app: &mut App, prompt: String) -> Result<String, Box<dyn
         name: None,
         tool_calls: None,
     };
-    app.sessionmanager.add_message_to_current(user_message);
+    {
+        let mut sm = sessionmanager.lock().await;
+        sm.add_message_to_current(user_message);
+    }
 
-    let config = app.sessionmanager.get_current_config().unwrap();
+    let config = {
+        let sm = sessionmanager.lock().await;
+        sm.get_current_config().unwrap()
+    };
 
     for _ in 0..config.max_agent_steps {
-        // Get current messages for API request
-        let current_messages = app
-            .sessionmanager
-            .get_current_session()
-            .unwrap()
-            .messages
-            .clone();
+        let current_messages = {
+            let sm = sessionmanager.lock().await;
+            sm.get_current_session().unwrap().messages.clone()
+        };
 
         let request = openrouter_rs::api::chat::ChatCompletionRequest::builder()
             .model(&config.modelname)
@@ -486,77 +642,98 @@ async fn agent_main_run(app: &mut App, prompt: String) -> Result<String, Box<dyn
         let response = match client.chat().create(&request).await {
             Ok(response) => response,
             Err(err) => {
-                let modelname = config.modelname;
-                app.eventlog.push(format!(
-                    "OpenRouter request failed for model `{modelname}`: {err:?}"
-                ));
-                return Err(Box::new(err) as Box<dyn Error>);
+                let modelname = config.modelname.clone();
+                let _ = event_tx
+                    .send(AgentEvent::Error {
+                        message: format!(
+                            "OpenRouter request failed for model `{modelname}`: {err:?}"
+                        ),
+                    })
+                    .await;
+                return Err(Box::new(err) as Box<dyn Error + Send + Sync>);
             }
         };
 
         let Some(choice) = response.choices.first() else {
-            app.eventlog
-                .push("Crust Agent: No Response quitting.........".to_string());
+            let _ = event_tx
+                .send(AgentEvent::Error {
+                    message: "Crust Agent: No Response quitting.........".to_string(),
+                })
+                .await;
             break;
         };
 
         if let Some(details) = choice.reasoning_details() {
             for block in details {
                 if let Some(text) = block.content() {
-                    app.eventlog.push(format!(
-                        "Thinking block [{}]:\n{}",
-                        block.reasoning_type(),
-                        text
-                    ));
+                    let _ = event_tx
+                        .send(AgentEvent::Thinking {
+                            kind: block.reasoning_type().to_string(),
+                            text: text.to_string(),
+                        })
+                        .await;
                 }
             }
         }
 
         if let Some(tool_calls) = choice.tool_calls() {
-            // Add assistant message with tool calls to session
-            app.sessionmanager
-                .add_message_to_current(Message::assistant_with_tool_calls(
+            {
+                let mut sm = sessionmanager.lock().await;
+                sm.add_message_to_current(Message::assistant_with_tool_calls(
                     choice.content().unwrap_or(""),
                     tool_calls.to_vec(),
                 ));
+            }
 
             for tool_call in tool_calls {
-                let tool_result = execute_tool_call(tool_call).await?;
-                app.eventlog.push(format!(
-                    "tool call:  {} -> {}",
-                    tool_call.name(),
-                    tool_result
-                ));
+                let _ = event_tx
+                    .send(AgentEvent::ToolCallStarted {
+                        name: tool_call.name().to_string(),
+                        args: tool_call.arguments_json().to_string(),
+                    })
+                    .await;
 
-                // Add tool response to session
-                app.sessionmanager
-                    .add_message_to_current(Message::tool_response_named(
+                let tool_result = execute_tool_call(tool_call).await?;
+
+                let _ = event_tx
+                    .send(AgentEvent::ToolCallFinished {
+                        name: tool_call.name().to_string(),
+                        result: tool_result.clone(),
+                    })
+                    .await;
+
+                {
+                    let mut sm = sessionmanager.lock().await;
+                    sm.add_message_to_current(Message::tool_response_named(
                         tool_call.id(),
                         tool_call.name(),
                         tool_result,
                     ));
+                }
             }
 
             continue;
         } else {
-            // Add final assistant message to session
-            app.sessionmanager.add_message_to_current(Message::new(
-                Role::Assistant,
-                choice.content().unwrap_or(""),
-            ));
+            let final_content = choice.content().unwrap_or("").to_string();
+            {
+                let mut sm = sessionmanager.lock().await;
+                sm.add_message_to_current(Message::new(Role::Assistant, final_content.clone()));
+            }
 
-            return Ok(format!(
-                "{}Crust Agent:{}\n{}",
-                ("=").repeat(50),
-                ("=").repeat(50),
-                choice.content().unwrap_or("")
-            ));
+            let _ = event_tx
+                .send(AgentEvent::AssistantFinal {
+                    text: final_content,
+                })
+                .await;
+            return Ok(());
         }
     }
-    Ok("Agent reached max steps without producing a final response.".to_string())
+
+    let _ = event_tx.send(AgentEvent::MaxStepsReached).await;
+    Ok(())
 }
 
-async fn execute_tool_call(tc: &ToolCall) -> Result<String, Box<dyn Error>> {
+async fn execute_tool_call(tc: &ToolCall) -> Result<String, Box<dyn Error + Send + Sync>> {
     //Web Search tool exec
 
     if tc.is_tool::<WebSearchParams>() {
