@@ -24,7 +24,7 @@ use ratatui::{
     Frame, Terminal,
     backend::{Backend, CrosstermBackend},
     crossterm::{
-        event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
+        event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseEventKind},
         execute,
         terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
     },
@@ -49,6 +49,9 @@ pub struct App {
     cursor_visible: bool,
     last_cursor_toggle: Instant,
     agent_task: Option<JoinHandle<()>>,
+    sidebar_width: u16,
+    is_dragging_divider: bool,
+    hover_divider: bool,
 }
 
 #[derive(Debug, Default, PartialEq, Eq, Clone)]
@@ -134,6 +137,9 @@ impl App {
             cursor_visible: true,
             last_cursor_toggle: Instant::now(),
             agent_task: None,
+            sidebar_width: 30,
+            is_dragging_divider: false,
+            hover_divider: false,
         }
     }
 
@@ -231,7 +237,7 @@ impl TypedTool for ReadFileParams {
         "read_file_tool"
     }
     fn description() -> &'static str {
-        "Read a file using its file name, starting from the offest value and ending at the limit value, and get a string containing its contents"
+        "Read a file using its file name, starting from the offest value and ending at the limit value, and get a string containing its contents, increment the offset with a fixed limit to read an entire file in chunks"
     }
 }
 
@@ -319,96 +325,121 @@ where
             continue;
         }
 
-        let Event::Key(key) = event::read()? else {
-            continue;
-        };
+        let event = event::read()?;
 
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
+        match event {
+            Event::Mouse(mouse_event) => {
+                let divider_x = app.sidebar_width;
+                let area = terminal.size()?;
 
-        match key.code {
-            KeyCode::Char(c) => {
-                app.inputbuffer.push(c);
-                app.cursor_visible = true;
-                app.last_cursor_toggle = Instant::now();
-            }
-            KeyCode::Backspace => {
-                app.inputbuffer.pop();
-                app.cursor_visible = true;
-                app.last_cursor_toggle = Instant::now();
-            }
-            KeyCode::Up => {
-                app.event_scroll = app.event_scroll.saturating_sub(1);
-            }
-            KeyCode::Down => {
-                app.event_scroll = app.event_scroll.saturating_add(1).min(app.event_max_scroll);
-            }
-            KeyCode::PageUp => {
-                app.event_scroll = app.event_scroll.saturating_sub(10);
-            }
-            KeyCode::PageDown => {
-                app.event_scroll = app
-                    .event_scroll
-                    .saturating_add(10)
-                    .min(app.event_max_scroll);
-            }
-            KeyCode::Home => {
-                app.event_scroll = 0;
-            }
-            KeyCode::End => {
-                app.event_scroll = app.event_max_scroll;
-            }
-            KeyCode::Esc => {
-                if let Some(task) = app.agent_task.take() {
-                    task.abort();
-                    app.handle_agent_event(AgentEvent::Error {
-                        message: "Agent run cancelled by user.".to_string(),
-                    });
-                } else {
-                    break;
-                }
-            }
-            KeyCode::Enter => {
-                let prompt = app.inputbuffer.trim().to_string();
-                app.inputbuffer.clear();
-                app.cursor_visible = true;
-                app.last_cursor_toggle = Instant::now();
+                app.hover_divider =
+                    mouse_event.column.abs_diff(divider_x) <= 1 && mouse_event.row < area.height;
 
-                if prompt.is_empty() {
-                    continue;
-                }
-                if handle_session_command(app, &prompt).await {
-                    if app.inputstate == InputState::Exit {
-                        break;
+                match mouse_event.kind {
+                    MouseEventKind::Down(_) if app.hover_divider => {
+                        app.is_dragging_divider = true;
                     }
-                    continue;
-                }
-
-                if app.agent_task.is_some() {
-                    app.handle_agent_event(AgentEvent::Error {
-                        message: "Agent is already running.".to_string(),
-                    });
-                    continue;
-                }
-
-                app.handle_agent_event(AgentEvent::UserSubmitted {
-                    prompt: prompt.clone(),
-                });
-                terminal.draw(|f| ui(f, app))?;
-
-                let sessionmanager = Arc::clone(&app.sessionmanager);
-                let tx = agent_tx.clone();
-                app.agent_task = Some(tokio::spawn(async move {
-                    if let Err(err) = agent_main_run(sessionmanager, prompt, tx.clone()).await {
-                        let _ = tx
-                            .send(AgentEvent::Error {
-                                message: err.to_string(),
-                            })
-                            .await;
+                    MouseEventKind::Drag(_) if app.is_dragging_divider => {
+                        let total = area.width;
+                        app.sidebar_width = mouse_event.column.clamp(10, total.saturating_sub(20));
                     }
-                    let _ = tx.send(AgentEvent::Finished).await;
-                }));
+                    MouseEventKind::Up(_) => {
+                        app.is_dragging_divider = false;
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            Event::Key(key) => {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+
+                match key.code {
+                    KeyCode::Char(c) => {
+                        app.inputbuffer.push(c);
+                        app.cursor_visible = true;
+                        app.last_cursor_toggle = Instant::now();
+                    }
+                    KeyCode::Backspace => {
+                        app.inputbuffer.pop();
+                        app.cursor_visible = true;
+                        app.last_cursor_toggle = Instant::now();
+                    }
+                    KeyCode::Up => {
+                        app.event_scroll = app.event_scroll.saturating_sub(1);
+                    }
+                    KeyCode::Down => {
+                        app.event_scroll = app.event_scroll.saturating_add(1).min(app.event_max_scroll);
+                    }
+                    KeyCode::PageUp => {
+                        app.event_scroll = app.event_scroll.saturating_sub(10);
+                    }
+                    KeyCode::PageDown => {
+                        app.event_scroll = app
+                            .event_scroll
+                            .saturating_add(10)
+                            .min(app.event_max_scroll);
+                    }
+                    KeyCode::Home => {
+                        app.event_scroll = 0;
+                    }
+                    KeyCode::End => {
+                        app.event_scroll = app.event_max_scroll;
+                    }
+                    KeyCode::Esc => {
+                        if let Some(task) = app.agent_task.take() {
+                            task.abort();
+                            app.handle_agent_event(AgentEvent::Error {
+                                message: "Agent run cancelled by user.".to_string(),
+                            });
+                        } else {
+                            break;
+                        }
+                    }
+                    KeyCode::Enter => {
+                        let prompt = app.inputbuffer.trim().to_string();
+                        app.inputbuffer.clear();
+                        app.cursor_visible = true;
+                        app.last_cursor_toggle = Instant::now();
+
+                        if prompt.is_empty() {
+                            continue;
+                        }
+                        if handle_session_command(app, &prompt).await {
+                            if app.inputstate == InputState::Exit {
+                                break;
+                            }
+                            continue;
+                        }
+
+                        if app.agent_task.is_some() {
+                            app.handle_agent_event(AgentEvent::Error {
+                                message: "Agent is already running.".to_string(),
+                            });
+                            continue;
+                        }
+
+                        app.handle_agent_event(AgentEvent::UserSubmitted {
+                            prompt: prompt.clone(),
+                        });
+                        terminal.draw(|f| ui(f, app))?;
+
+                        let sessionmanager = Arc::clone(&app.sessionmanager);
+                        let tx = agent_tx.clone();
+                        app.agent_task = Some(tokio::spawn(async move {
+                            if let Err(err) = agent_main_run(sessionmanager, prompt, tx.clone()).await {
+                                let _ = tx
+                                    .send(AgentEvent::Error {
+                                        message: err.to_string(),
+                                    })
+                                    .await;
+                            }
+                            let _ = tx.send(AgentEvent::Finished).await;
+                        }));
+                    }
+                    _ => {}
+                }
             }
             _ => {}
         }
@@ -499,15 +530,52 @@ async fn handle_session_command(app: &mut App, prompt: &str) -> bool {
 }
 
 fn ui(frame: &mut Frame, app: &mut App) {
-    let chunks = Layout::default()
+    let area = frame.area();
+
+    let h_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(app.sidebar_width),
+            Constraint::Min(10),
+        ])
+        .split(area);
+
+    let v_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(3), Constraint::Length(5)])
-        .split(frame.area());
+        .split(h_chunks[1]);
+
+    let sidebar_content = match app.sessionmanager.try_lock() {
+        Ok(sm) => {
+            let names = sm.list_session_names();
+            if names.is_empty() {
+                "No sessions".to_string()
+            } else {
+                names.join("\n")
+            }
+        }
+        Err(_) => "Loading...".to_string(),
+    };
+
+    let border_style = if app.is_dragging_divider || app.hover_divider {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default()
+    };
+
+    let sidebar = Paragraph::new(sidebar_content)
+        .block(
+            Block::default()
+                .title(" Sessions ")
+                .borders(Borders::ALL)
+                .border_style(border_style),
+        )
+        .wrap(Wrap { trim: false });
 
     let lines: Vec<Line> = app.eventlog.iter().flat_map(log_entry_to_lines).collect();
 
-    let events_view_height = usize::from(chunks[0].height.saturating_sub(2));
-    let events_view_width = usize::from(chunks[0].width.saturating_sub(2)).max(1);
+    let events_view_height = usize::from(v_chunks[0].height.saturating_sub(2));
+    let events_view_width = usize::from(v_chunks[0].width.saturating_sub(2)).max(1);
     let rendered_height: usize = lines
         .iter()
         .map(|line| line.width().div_ceil(events_view_width).max(1))
@@ -541,8 +609,9 @@ fn ui(frame: &mut Frame, app: &mut App) {
         .style(Style::default().fg(Color::LightYellow))
         .wrap(Wrap { trim: false });
 
-    frame.render_widget(events_pane, chunks[0]);
-    frame.render_widget(input_pane, chunks[1]);
+    frame.render_widget(sidebar, h_chunks[0]);
+    frame.render_widget(events_pane, v_chunks[0]);
+    frame.render_widget(input_pane, v_chunks[1]);
 }
 
 fn push_log_lines(lines: &mut Vec<Line<'static>>, style: Style, text: String) {
