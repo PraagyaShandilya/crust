@@ -54,6 +54,18 @@ pub struct Session {
     pub messages: Vec<Message>,
     pub sysprompt: Message,
     pub config: Config,
+    #[serde(default)]
+    pub latest_prompt_tokens: u32,
+    #[serde(default)]
+    pub latest_completion_tokens: u32,
+    #[serde(default)]
+    pub latest_total_tokens: u32,
+    #[serde(default)]
+    pub cumulative_prompt_tokens: u64,
+    #[serde(default)]
+    pub cumulative_completion_tokens: u64,
+    #[serde(default)]
+    pub cumulative_total_tokens: u64,
 }
 
 impl Session {
@@ -70,6 +82,12 @@ impl Session {
             messages,
             sysprompt,
             config,
+            latest_prompt_tokens: 0,
+            latest_completion_tokens: 0,
+            latest_total_tokens: 0,
+            cumulative_prompt_tokens: 0,
+            cumulative_completion_tokens: 0,
+            cumulative_total_tokens: 0,
         }
     }
 
@@ -79,6 +97,16 @@ impl Session {
 
     pub fn add_message(&mut self, message: Message) {
         self.messages.push(message);
+        self.touch();
+    }
+
+    pub fn record_usage(&mut self, prompt_tokens: u32, completion_tokens: u32, total_tokens: u32) {
+        self.latest_prompt_tokens = prompt_tokens;
+        self.latest_completion_tokens = completion_tokens;
+        self.latest_total_tokens = total_tokens;
+        self.cumulative_prompt_tokens += u64::from(prompt_tokens);
+        self.cumulative_completion_tokens += u64::from(completion_tokens);
+        self.cumulative_total_tokens += u64::from(total_tokens);
         self.touch();
     }
 
@@ -197,6 +225,18 @@ impl SessionManager {
     pub fn add_message_to_current(&mut self, message: Message) {
         if let Some(session) = self.get_current_session_mut() {
             session.add_message(message);
+            self.save_sessions();
+        }
+    }
+
+    pub fn record_usage_to_current(
+        &mut self,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        total_tokens: u32,
+    ) {
+        if let Some(session) = self.get_current_session_mut() {
+            session.record_usage(prompt_tokens, completion_tokens, total_tokens);
             self.save_sessions();
         }
     }
