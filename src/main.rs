@@ -1,6 +1,8 @@
+mod context;
 mod models_generated;
 mod session;
 
+use context::ContextBuilder;
 use futures_util::StreamExt;
 use openrouter_rs::{
     Content,
@@ -44,11 +46,15 @@ use ratatui::{
 pub struct App {
     system_message: &'static str,
     sessionmanager: Arc<Mutex<SessionManager>>,
+    current_session_id: String,
     current_session_title: String,
     inputstate: InputState,
     agentstate: AgentState,
     inputbuffer: String,
+    cursor_pos: usize,
     eventlog: Vec<LogEntry>,
+    active_assistant_log_index: Option<usize>,
+    active_thinking_log_index: Option<usize>,
     event_scroll: usize,
     event_max_scroll: usize,
     cursor_visible: bool,
@@ -62,6 +68,7 @@ pub struct App {
     sidebar_mode: SidebarMode,
     sidebar_scroll: u16,
     sidebar_selected: usize,
+    slash_command_selected: usize,
 }
 
 #[derive(Debug, Default, PartialEq, Eq, Clone)]
@@ -71,6 +78,13 @@ pub enum AgentState {
     Done,
     Thinking,
     Tool,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaggedAgentEvent {
+    pub session_id: String,
+    pub event: AgentEvent,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +96,7 @@ pub enum AgentEvent {
     AssistantDelta { text: String },
     AssistantFinal { text: String },
     Error { message: String },
+    SystemNotice { message: String },
     MaxStepsReached,
     SessionTitleUpdated { title: String },
     Finished,
@@ -90,7 +105,8 @@ pub enum AgentEvent {
 #[derive(Debug, Clone)]
 pub enum LogEntry {
     User(String),
-    Assistant(String),
+    Assistant(String),        // In-progress streaming
+    AssistantFinal(String),   // Completed final response
     Thinking { kind: String, text: String },
     ToolCall { name: String, args: String },
     ToolResult { name: String, result: String },
@@ -111,6 +127,30 @@ pub enum SidebarMode {
     #[default]
     Sessions,
     Models,
+    SlashCommands,
+}
+
+const SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("/exit", "Exit the application"),
+    ("/new <session_name>", "Create a new session"),
+    ("/clear", "Clear current session history"),
+    ("/context", "Show context status"),
+    ("/compact", "Compact session history"),
+    ("/delete <session_name>", "Delete a session"),
+    ("/switch <session_name>", "Switch to a session"),
+];
+
+fn get_filtered_commands(filter: &str) -> Vec<(&'static str, &'static str)> {
+    let filter_lower = filter.trim().to_lowercase();
+    if filter_lower.is_empty() || filter_lower == "/" {
+        SLASH_COMMANDS.to_vec()
+    } else {
+        SLASH_COMMANDS
+            .iter()
+            .copied()
+            .filter(|(cmd, _)| cmd.to_lowercase().starts_with(&filter_lower))
+            .collect()
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq, Clone)]
@@ -118,6 +158,33 @@ pub enum Focus {
     #[default]
     Input,
     Sidebar,
+}
+
+fn append_delta(existing: &mut String, delta: &str) {
+    if delta.is_empty() || existing.ends_with(delta) {
+        return;
+    }
+
+    // Some providers/SDK layers send cumulative text instead of true deltas.
+    // If so, append only the new suffix instead of duplicating text.
+    if delta.starts_with(existing.as_str()) {
+        existing.push_str(&delta[existing.len()..]);
+        return;
+    }
+
+    // Also handle partial overlaps between adjacent chunks, e.g.
+    // existing="hello wor" delta="world" -> append only "ld".
+    let max_overlap = existing.len().min(delta.len());
+    let mut delta_boundaries: Vec<usize> = delta.char_indices().map(|(idx, _)| idx).collect();
+    delta_boundaries.push(delta.len());
+    for overlap in delta_boundaries.into_iter().rev() {
+        if overlap > 0 && overlap <= max_overlap && existing.ends_with(&delta[..overlap]) {
+            existing.push_str(&delta[overlap..]);
+            return;
+        }
+    }
+
+    existing.push_str(delta);
 }
 
 fn format_token_count(tokens: usize) -> String {
@@ -130,28 +197,45 @@ fn format_token_count(tokens: usize) -> String {
     }
 }
 
-fn format_current_session_title(session: &Session) -> String {
-    let used_tokens = session.latest_total_tokens as usize;
-    match models_generated::get_openrouter_model(&session.config.modelname) {
-        Some(model) => format!(
-            "{} - {} | {} | {}/{} toks ({:.1}%) | total {} toks",
-            session.name,
-            session.id,
-            model.id,
-            format_token_count(used_tokens),
-            format_token_count(model.context_window as usize),
-            (used_tokens as f64 / model.context_window as f64) * 100.0,
-            format_token_count(session.cumulative_total_tokens as usize)
-        ),
-        None => format!(
-            "{} - {} | {} | {} toks/? ctx | total {} toks",
-            session.name,
-            session.id,
-            session.config.modelname,
-            format_token_count(used_tokens),
-            format_token_count(session.cumulative_total_tokens as usize)
-        ),
+fn context_pressure_message(
+    context_builder: &ContextBuilder,
+    config: &session::Config,
+    prompt_tokens_sent: u32,
+) -> Option<String> {
+    if !context_builder.should_compact_from_api_usage(prompt_tokens_sent, config) {
+        return None;
     }
+
+    let context_window_tokens = context_builder.context_window_tokens(config);
+    let ratio = context_builder.context_ratio_from_api_usage(prompt_tokens_sent, config) * 100.0;
+    Some(format!(
+        "Context pressure: sent {}/{} prompt toks ({ratio:.1}%). Run /compact before the next large turn.",
+        format_token_count(prompt_tokens_sent as usize),
+        format_token_count(context_window_tokens),
+    ))
+}
+
+fn format_current_session_title(session: &Session) -> String {
+    let context_builder = ContextBuilder::default();
+    let context_window_tokens = context_builder.context_window_tokens(&session.config);
+    let prompt_tokens = session.latest_prompt_tokens;
+    let completion_tokens = session.latest_completion_tokens;
+    let total_tokens = session.latest_total_tokens;
+    let context_ratio =
+        context_builder.context_ratio_from_api_usage(prompt_tokens, &session.config) * 100.0;
+
+    format!(
+        "{} - {} | {} | ctx {}/{} ({context_ratio:.1}%) | last p/c/t {}/{}/{} | total {} toks",
+        session.name,
+        session.id,
+        session.config.modelname,
+        format_token_count(prompt_tokens as usize),
+        format_token_count(context_window_tokens),
+        format_token_count(prompt_tokens as usize),
+        format_token_count(completion_tokens as usize),
+        format_token_count(total_tokens as usize),
+        format_token_count(session.cumulative_total_tokens as usize)
+    )
 }
 
 impl App {
@@ -167,10 +251,12 @@ impl App {
 
         let mut eventlog = Vec::new();
         let current_session_title;
+        let current_session_id;
         let initial_scroll;
         if session_manager.load_most_recent_session() {
             let current_session = session_manager.get_current_session().unwrap();
             current_session_title = format_current_session_title(current_session);
+            current_session_id = current_session.id.clone();
 
             // Load historical messages into eventlog
             for message in &current_session.messages {
@@ -191,6 +277,7 @@ impl App {
             let default_session =
                 session_manager.create_session("Default".to_string(), system_message);
             current_session_title = format_current_session_title(default_session);
+            current_session_id = default_session.id.clone();
             eventlog.push(LogEntry::System(format!(
                 "Created session: {}",
                 default_session.name
@@ -201,11 +288,15 @@ impl App {
         Self {
             system_message,
             sessionmanager: Arc::new(Mutex::new(session_manager)),
+            current_session_id,
             current_session_title,
             inputstate: InputState::default(),
             agentstate: AgentState::default(),
             inputbuffer: "".to_string(),
+            cursor_pos: 0,
             eventlog,
+            active_assistant_log_index: None,
+            active_thinking_log_index: None,
             event_scroll: initial_scroll,
             event_max_scroll: 0,
             cursor_visible: true,
@@ -219,6 +310,7 @@ impl App {
             sidebar_mode: SidebarMode::default(),
             sidebar_scroll: 0,
             sidebar_selected: 0,
+            slash_command_selected: 0,
         }
     }
 
@@ -233,14 +325,33 @@ impl App {
     pub fn handle_agent_event(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::UserSubmitted { prompt } => {
+                self.active_assistant_log_index = None;
+                self.active_thinking_log_index = None;
                 self.eventlog.push(LogEntry::User(prompt));
                 self.agentstate = AgentState::Thinking;
             }
             AgentEvent::Thinking { kind, text } => {
-                self.eventlog.push(LogEntry::Thinking { kind, text });
+                match self.active_thinking_log_index {
+                    Some(index) => match self.eventlog.get_mut(index) {
+                        Some(LogEntry::Thinking {
+                            text: existing_text,
+                            ..
+                        }) => append_delta(existing_text, &text),
+                        _ => {
+                            self.eventlog.push(LogEntry::Thinking { kind, text });
+                            self.active_thinking_log_index = Some(self.eventlog.len() - 1);
+                        }
+                    },
+                    None => {
+                        self.eventlog.push(LogEntry::Thinking { kind, text });
+                        self.active_thinking_log_index = Some(self.eventlog.len() - 1);
+                    }
+                }
                 self.agentstate = AgentState::Thinking;
             }
             AgentEvent::ToolCallStarted { name, args } => {
+                self.active_assistant_log_index = None;
+                self.active_thinking_log_index = None;
                 self.eventlog.push(LogEntry::ToolCall { name, args });
                 self.agentstate = AgentState::Tool;
             }
@@ -249,23 +360,53 @@ impl App {
                 self.agentstate = AgentState::Tool;
             }
             AgentEvent::AssistantDelta { text } => {
-                match self.eventlog.last_mut() {
-                    Some(LogEntry::Assistant(existing)) => existing.push_str(&text),
-                    _ => self.eventlog.push(LogEntry::Assistant(text)),
+                match self.active_assistant_log_index {
+                    Some(index) => match self.eventlog.get_mut(index) {
+                        Some(LogEntry::Assistant(existing)) => append_delta(existing, &text),
+                        _ => {
+                            self.eventlog.push(LogEntry::Assistant(text));
+                            self.active_assistant_log_index = Some(self.eventlog.len() - 1);
+                        }
+                    },
+                    None => {
+                        self.eventlog.push(LogEntry::Assistant(text));
+                        self.active_assistant_log_index = Some(self.eventlog.len() - 1);
+                    }
                 }
                 self.agentstate = AgentState::Thinking;
             }
             AgentEvent::AssistantFinal { text } => {
-                if !matches!(self.eventlog.last(), Some(LogEntry::Assistant(existing)) if existing == &text) {
-                    self.eventlog.push(LogEntry::Assistant(text));
+                let already_displayed = self
+                    .active_assistant_log_index
+                    .and_then(|index| self.eventlog.get(index))
+                    .is_some_and(
+                        |entry| matches!(entry, LogEntry::Assistant(existing) if existing == &text),
+                    );
+
+                if already_displayed {
+                    // Replace the streaming entry with a final entry for better formatting
+                    if let Some(index) = self.active_assistant_log_index {
+                        self.eventlog[index] = LogEntry::AssistantFinal(text);
+                    }
+                } else {
+                    self.eventlog.push(LogEntry::AssistantFinal(text));
                 }
+                self.active_assistant_log_index = None;
+                self.active_thinking_log_index = None;
                 self.agentstate = AgentState::Done;
             }
             AgentEvent::Error { message } => {
+                self.active_assistant_log_index = None;
+                self.active_thinking_log_index = None;
                 self.eventlog.push(LogEntry::Error(message));
-                self.agentstate = AgentState::Done;
+                self.agentstate = AgentState::Error;
+            }
+            AgentEvent::SystemNotice { message } => {
+                self.eventlog.push(LogEntry::System(message));
             }
             AgentEvent::MaxStepsReached => {
+                self.active_assistant_log_index = None;
+                self.active_thinking_log_index = None;
                 self.eventlog.push(LogEntry::Error(
                     "Agent reached max steps without producing a final response.".to_string(),
                 ));
@@ -275,6 +416,8 @@ impl App {
                 self.current_session_title = title;
             }
             AgentEvent::Finished => {
+                self.active_assistant_log_index = None;
+                self.active_thinking_log_index = None;
                 self.agent_task = None;
                 self.agentstate = AgentState::Done;
             }
@@ -321,12 +464,12 @@ fn message_to_log_entry(message: &Message) -> Option<LogEntry> {
                         args: tc.arguments_json().to_string(),
                     })
                 } else if let Content::Text(text) = &message.content {
-                    Some(LogEntry::Assistant(text.clone()))
+                    Some(LogEntry::AssistantFinal(text.clone()))
                 } else {
                     None
                 }
             } else if let Content::Text(text) = &message.content {
-                Some(LogEntry::Assistant(text.clone()))
+                Some(LogEntry::AssistantFinal(text.clone()))
             } else {
                 None
             }
@@ -472,11 +615,14 @@ async fn run_app<B: Backend>(
 where
     B::Error: Error + 'static,
 {
-    let (agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(100);
+    let (agent_tx, mut agent_rx) = mpsc::channel::<TaggedAgentEvent>(100);
 
     loop {
-        while let Ok(event) = agent_rx.try_recv() {
-            app.handle_agent_event(event);
+        while let Ok(tagged) = agent_rx.try_recv() {
+            // Filter out stale events from a previous session
+            if tagged.session_id == app.current_session_id {
+                app.handle_agent_event(tagged.event);
+            }
         }
 
         if app.last_cursor_toggle.elapsed() >= Duration::from_millis(500) {
@@ -565,22 +711,76 @@ where
                         continue;
                     }
                     KeyCode::Char(c) if app.focus == Focus::Input => {
-                        app.inputbuffer.push(c);
+                        app.inputbuffer.insert(app.cursor_pos, c);
+                        app.cursor_pos += 1;
+                        app.cursor_visible = true;
+                        app.last_cursor_toggle = Instant::now();
+                        // Auto-switch sidebar to slash-command mode when input starts with '/'
+                        if app.inputbuffer.starts_with('/') {
+                            app.sidebar_mode = SidebarMode::SlashCommands;
+                            app.slash_command_selected = 0;
+                            app.sidebar_scroll = 0;
+                        } else if app.sidebar_mode == SidebarMode::SlashCommands {
+                            // User typed something else after '/', exit slash-command mode
+                            app.sidebar_mode = SidebarMode::Sessions;
+                            app.slash_command_selected = 0;
+                        }
+                        continue;
+                    }
+                    KeyCode::Backspace if app.focus == Focus::Input => {
+                        if app.cursor_pos > 0 {
+                            app.cursor_pos -= 1;
+                            app.inputbuffer.remove(app.cursor_pos);
+                        }
+                        app.cursor_visible = true;
+                        app.last_cursor_toggle = Instant::now();
+                        // If buffer is now empty or doesn't start with '/', exit slash-command mode
+                        if app.inputbuffer.is_empty() || !app.inputbuffer.starts_with('/') {
+                            app.sidebar_mode = SidebarMode::Sessions;
+                            app.slash_command_selected = 0;
+                        } else if app.sidebar_mode == SidebarMode::SlashCommands {
+                            // Reset selection to top when filter changes
+                            app.slash_command_selected = 0;
+                            app.sidebar_scroll = 0;
+                        }
+                        continue;
+                    }
+                    KeyCode::Left if app.focus == Focus::Input => {
+                        if app.cursor_pos > 0 {
+                            app.cursor_pos -= 1;
+                        }
                         app.cursor_visible = true;
                         app.last_cursor_toggle = Instant::now();
                         continue;
                     }
-                    KeyCode::Backspace if app.focus == Focus::Input => {
-                        app.inputbuffer.pop();
+                    KeyCode::Right if app.focus == Focus::Input => {
+                        if app.cursor_pos < app.inputbuffer.len() {
+                            app.cursor_pos += 1;
+                        }
                         app.cursor_visible = true;
                         app.last_cursor_toggle = Instant::now();
                         continue;
                     }
                     KeyCode::Enter if app.focus == Focus::Input => {
-                        let prompt = app.inputbuffer.trim().to_string();
+                        // If in slash-command mode with a selection, use that command
+                        let prompt = if app.sidebar_mode == SidebarMode::SlashCommands {
+                            let filtered = get_filtered_commands(&app.inputbuffer);
+                            if let Some((cmd, _)) = filtered.get(app.slash_command_selected) {
+                                app.inputbuffer.clear();
+                                cmd.to_string()
+                            } else {
+                                app.inputbuffer.trim().to_string()
+                            }
+                        } else {
+                            app.inputbuffer.trim().to_string()
+                        };
                         app.inputbuffer.clear();
+                        app.cursor_pos = 0;
                         app.cursor_visible = true;
                         app.last_cursor_toggle = Instant::now();
+                        // Exit slash-command mode after submit
+                        app.sidebar_mode = SidebarMode::Sessions;
+                        app.slash_command_selected = 0;
 
                         if prompt.is_empty() {
                             continue;
@@ -599,6 +799,9 @@ where
                             continue;
                         }
 
+                        // Capture current session ID before spawning task
+                        let current_session_id = app.current_session_id.clone();
+
                         app.handle_agent_event(AgentEvent::UserSubmitted {
                             prompt: prompt.clone(),
                         });
@@ -606,17 +809,24 @@ where
 
                         let sessionmanager = Arc::clone(&app.sessionmanager);
                         let tx = agent_tx.clone();
+                        let spawn_session_id = current_session_id.clone();
                         app.agent_task = Some(tokio::spawn(async move {
                             if let Err(err) =
-                                agent_main_run(sessionmanager, prompt, tx.clone()).await
+                                agent_main_run(sessionmanager, prompt, current_session_id, tx.clone()).await
                             {
                                 let _ = tx
-                                    .send(AgentEvent::Error {
-                                        message: err.to_string(),
+                                    .send(TaggedAgentEvent {
+                                        session_id: spawn_session_id.clone(),
+                                        event: AgentEvent::Error {
+                                            message: err.to_string(),
+                                        },
                                     })
                                     .await;
                             }
-                            let _ = tx.send(AgentEvent::Finished).await;
+                            let _ = tx.send(TaggedAgentEvent {
+                                session_id: spawn_session_id,
+                                event: AgentEvent::Finished,
+                            }).await;
                         }));
                         continue;
                     }
@@ -627,28 +837,70 @@ where
                 match app.focus {
                     Focus::Input => match key.code {
                         KeyCode::Up => {
-                            app.event_scroll = app.event_scroll.saturating_sub(1);
-                            app.follow_mode = false;
+                            if app.sidebar_mode == SidebarMode::SlashCommands {
+                                app.slash_command_selected =
+                                    app.slash_command_selected.saturating_sub(1);
+                                app.sidebar_scroll = app.sidebar_scroll.saturating_sub(1);
+                            } else {
+                                app.event_scroll = app.event_scroll.saturating_sub(1);
+                                app.follow_mode = false;
+                            }
                         }
                         KeyCode::Down => {
-                            app.event_scroll = app.event_scroll.saturating_add(1);
-                            app.follow_mode = false;
+                            if app.sidebar_mode == SidebarMode::SlashCommands {
+                                let filtered = get_filtered_commands(&app.inputbuffer);
+                                let max = filtered.len().saturating_sub(1);
+                                app.slash_command_selected =
+                                    (app.slash_command_selected + 1).min(max);
+                                app.sidebar_scroll =
+                                    (app.sidebar_scroll + 1).min(max as u16);
+                            } else {
+                                app.event_scroll = app.event_scroll.saturating_add(1);
+                                app.follow_mode = false;
+                            }
                         }
                         KeyCode::PageUp => {
-                            app.event_scroll = app.event_scroll.saturating_sub(10);
-                            app.follow_mode = false;
+                            if app.sidebar_mode == SidebarMode::SlashCommands {
+                                app.slash_command_selected =
+                                    app.slash_command_selected.saturating_sub(5);
+                                app.sidebar_scroll = app.sidebar_scroll.saturating_sub(5);
+                            } else {
+                                app.event_scroll = app.event_scroll.saturating_sub(10);
+                                app.follow_mode = false;
+                            }
                         }
                         KeyCode::PageDown => {
-                            app.event_scroll = app.event_scroll.saturating_add(10);
-                            app.follow_mode = false;
+                            if app.sidebar_mode == SidebarMode::SlashCommands {
+                                let filtered = get_filtered_commands(&app.inputbuffer);
+                                let max = filtered.len().saturating_sub(1);
+                                app.slash_command_selected =
+                                    (app.slash_command_selected + 5).min(max);
+                                app.sidebar_scroll =
+                                    (app.sidebar_scroll + 5).min(max as u16);
+                            } else {
+                                app.event_scroll = app.event_scroll.saturating_add(10);
+                                app.follow_mode = false;
+                            }
                         }
                         KeyCode::Home => {
-                            app.event_scroll = 0;
-                            app.follow_mode = false;
+                            if app.sidebar_mode == SidebarMode::SlashCommands {
+                                app.slash_command_selected = 0;
+                                app.sidebar_scroll = 0;
+                            } else {
+                                app.event_scroll = 0;
+                                app.follow_mode = false;
+                            }
                         }
                         KeyCode::End => {
-                            app.event_scroll = usize::MAX;
-                            app.follow_mode = true;
+                            if app.sidebar_mode == SidebarMode::SlashCommands {
+                                let filtered = get_filtered_commands(&app.inputbuffer);
+                                app.slash_command_selected = filtered.len().saturating_sub(1);
+                                app.sidebar_scroll =
+                                    filtered.len().saturating_sub(1).min(u16::MAX as usize) as u16;
+                            } else {
+                                app.event_scroll = usize::MAX;
+                                app.follow_mode = true;
+                            }
                         }
                         _ => {}
                     },
@@ -736,43 +988,128 @@ async fn handle_session_command(app: &mut App, prompt: &str) -> bool {
         return true;
     }
 
-    if prompt == "/list" {
-        app.eventlog
-            .push(LogEntry::System("--- Sessions ---".to_string()));
+    if prompt == "/clear" {
+        let mut sessionmanager = app.sessionmanager.lock().await;
+        sessionmanager.clear_current_session();
+        if let Some(session) = sessionmanager.get_current_session() {
+            app.current_session_title = format_current_session_title(session);
+        }
+        app.eventlog.clear();
+        app.eventlog.push(LogEntry::System(
+            "Cleared current session history.".to_string(),
+        ));
+        app.event_scroll = 0;
+        app.follow_mode = true;
+        return true;
+    }
+
+    if prompt == "/context" {
+        let context_builder = ContextBuilder::default();
         let sessionmanager = app.sessionmanager.lock().await;
-        for session in sessionmanager.list_sessions() {
-            let current_marker = if sessionmanager
-                .get_current_session()
-                .is_some_and(|s| s.id == session.id)
-            {
-                " (current)"
-            } else {
-                ""
-            };
+        if let Some(session) = sessionmanager.get_current_session() {
+            let context = context_builder.build_context(session, &session.config);
+            let estimated_tokens = context_builder.estimate_context_tokens(&context);
+            let context_window = context_builder.context_window_tokens(&session.config);
+            let estimated_ratio =
+                context_builder.estimated_context_ratio(&context, &session.config);
+            let last_api_ratio = context_builder
+                .context_ratio_from_api_usage(session.latest_prompt_tokens, &session.config);
             app.eventlog.push(LogEntry::System(format!(
-                "ID: {} | Name: {} | Messages: {}{}",
-                session.id,
-                session.name,
+                "Context status:\nmodel: {}\ncontext window: {} toks\nbuilt context: {} messages, est. {} toks ({:.1}%)\nlast OpenRouter prompt usage: {} toks ({:.1}%)\nsummary: {}\ncompacted_until: {} / {} messages",
+                session.config.modelname,
+                format_token_count(context_window),
+                context.len(),
+                format_token_count(estimated_tokens),
+                estimated_ratio * 100.0,
+                format_token_count(session.latest_prompt_tokens as usize),
+                last_api_ratio * 100.0,
+                if session.summary.is_some() { "present" } else { "none" },
+                session.compacted_until,
                 session.messages.len(),
-                current_marker
             )));
         }
-        app.eventlog
-            .push(LogEntry::System("----------------".to_string()));
+        return true;
+    }
+
+    if prompt == "/compact" {
+        let context_builder = ContextBuilder::default();
+        let mut sessionmanager = app.sessionmanager.lock().await;
+        match sessionmanager.compact_current_session_to_recent(context_builder.min_recent_messages)
+        {
+            Ok(cutoff) => {
+                if let Some(session) = sessionmanager.get_current_session() {
+                    app.current_session_title = format_current_session_title(session);
+                }
+                app.eventlog.push(LogEntry::System(format!(
+                    "Compacted session history through message index {cutoff}. The model context will now use the summary plus the recent tail."
+                )));
+            }
+            Err(err) => app
+                .eventlog
+                .push(LogEntry::Error(format!("Compact failed: {err}"))),
+        }
+        return true;
+    }
+
+    if let Some(session_name) = prompt.strip_prefix("/delete ") {
+        let session_name = session_name.trim();
+        let mut sessionmanager = app.sessionmanager.lock().await;
+        match sessionmanager.find_session_id_by_name(session_name) {
+            Some(session_id) => {
+                if let Some(current) = sessionmanager.get_current_session() {
+                    if current.name == session_name {
+                        app.eventlog.push(LogEntry::Error(format!(
+                            "Cannot delete the active session '{session_name}'"
+                        )));
+                        return true;
+                    }
+                }
+                match sessionmanager.delete_session(&session_id) {
+                    Ok(_) => app.eventlog.push(LogEntry::System(format!(
+                        "Deleted session: {session_name}"
+                    ))),
+                    Err(e) => app.eventlog.push(LogEntry::Error(format!("Error: {e}"))),
+                }
+            }
+            None => app.eventlog.push(LogEntry::Error(format!(
+                "Error: session named '{session_name}' not found"
+            ))),
+        }
         return true;
     }
 
     if let Some(session_name) = prompt.strip_prefix("/switch ") {
         let session_name = session_name.trim();
+        // Block session switching while agent is running
+        if app.agent_task.is_some() {
+            app.eventlog.push(LogEntry::Error(
+                "Cannot switch sessions while agent is running. Press Esc to cancel first.".to_string(),
+            ));
+            return true;
+        }
         let mut sessionmanager = app.sessionmanager.lock().await;
         match sessionmanager.find_session_id_by_name(session_name) {
             Some(session_id) => match sessionmanager.switch_session(&session_id) {
                 Ok(session) => {
+                    app.current_session_id = session.id.clone();
                     app.current_session_title = format_current_session_title(session);
+                    // Clear and rebuild event log from the switched session's messages
+                    app.eventlog.clear();
+                    app.active_assistant_log_index = None;
+                    app.active_thinking_log_index = None;
+                    for message in &session.messages {
+                        if let Some(log_entry) = message_to_log_entry(message) {
+                            app.eventlog.push(log_entry);
+                        }
+                    }
                     app.eventlog.push(LogEntry::System(format!(
-                        "Switched to session: {}",
-                        session.name
+                        "Switched to session: {} ({} messages)",
+                        session.name,
+                        session.messages.len()
                     )));
+                    app.event_scroll = 0;
+                    app.follow_mode = true;
+                    app.agentstate = AgentState::Idle;
                 }
                 Err(e) => app.eventlog.push(LogEntry::Error(format!("Error: {e}"))),
             },
@@ -800,48 +1137,84 @@ fn ui(frame: &mut Frame, app: &mut App) {
         .split(h_chunks[1]);
 
     let (sidebar_title, sidebar_content, sidebar_scroll) = {
-        match app.sessionmanager.try_lock() {
-            Ok(sm) => match app.sidebar_mode {
-                SidebarMode::Sessions => {
-                    let names = sm.list_session_names();
-                    let content = if names.is_empty() {
-                        "No sessions".to_string()
-                    } else {
-                        names.join("\n")
-                    };
-                    (" Sessions ", content, 0u16)
-                }
-                SidebarMode::Models => {
-                    let current_id = sm
-                        .get_current_session()
-                        .map(|s| s.config.modelname.as_str())
-                        .unwrap_or("");
+        match app.sidebar_mode {
+            SidebarMode::SlashCommands => {
+                let filtered = get_filtered_commands(&app.inputbuffer);
+                let lines: Vec<String> = filtered
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (cmd, _desc))| {
+                        let marker = if i == app.slash_command_selected {
+                            "> "
+                        } else {
+                            "  "
+                        };
+                        format!("{}{}", marker, cmd)
+                    })
+                    .collect();
+                let content = if lines.is_empty() {
+                    "No matching commands".to_string()
+                } else {
+                    lines.join("\n")
+                };
+                (" Commands ", content, app.sidebar_scroll)
+            }
+            _ => match app.sessionmanager.try_lock() {
+                Ok(sm) => match app.sidebar_mode {
+                    SidebarMode::Sessions => {
+                        let current_name = sm
+                            .get_current_session()
+                            .map(|s| s.name.as_str())
+                            .unwrap_or("");
+                        let names = sm.list_session_names();
+                        let lines: Vec<String> = names
+                            .iter()
+                            .map(|name| {
+                                let active = if *name == current_name { " ●" } else { "" };
+                                format!("{}{}", name, active)
+                            })
+                            .collect();
+                        let content = if lines.is_empty() {
+                            "No sessions".to_string()
+                        } else {
+                            lines.join("\n")
+                        };
+                        (" Sessions ", content, 0u16)
+                    }
+                    SidebarMode::Models => {
+                        let current_id = sm
+                            .get_current_session()
+                            .map(|s| s.config.modelname.as_str())
+                            .unwrap_or("");
 
-                    let lines: Vec<String> = models_generated::OPENROUTER_MODELS
-                        .iter()
-                        .enumerate()
-                        .map(|(i, m)| {
-                            let marker = if i == app.sidebar_selected {
-                                "> "
-                            } else {
-                                "  "
-                            };
-                            let active = if m.id == current_id { " ●" } else { "" };
-                            format!("{}{}{}", marker, m.id, active)
-                        })
-                        .collect();
+                        let lines: Vec<String> = models_generated::OPENROUTER_MODELS
+                            .iter()
+                            .enumerate()
+                            .map(|(i, m)| {
+                                let marker = if i == app.sidebar_selected {
+                                    "> "
+                                } else {
+                                    "  "
+                                };
+                                let active = if m.id == current_id { " ●" } else { "" };
+                                format!("{}{}{}", marker, m.id, active)
+                            })
+                            .collect();
 
-                    let content = lines.join("\n");
-                    (" Models ", content, app.sidebar_scroll)
-                }
+                        let content = lines.join("\n");
+                        (" Models ", content, app.sidebar_scroll)
+                    }
+                    // SlashCommands already handled above
+                    SidebarMode::SlashCommands => unreachable!(),
+                },
+                Err(_) => (" Loading... ", "Loading...".to_string(), 0u16),
             },
-            Err(_) => (" Loading... ", "Loading...".to_string(), 0u16),
         }
     };
 
     let border_style = if app.is_dragging_divider || app.hover_divider {
         Style::default().fg(Color::Yellow)
-    } else if app.focus == Focus::Sidebar {
+    } else if app.focus == Focus::Sidebar || app.sidebar_mode == SidebarMode::SlashCommands {
         Style::default().fg(Color::Cyan)
     } else {
         Style::default()
@@ -885,19 +1258,39 @@ fn ui(frame: &mut Frame, app: &mut App) {
         .take(events_view_height)
         .collect();
 
+    let event_border_color = match app.agentstate {
+        AgentState::Thinking | AgentState::Tool => Color::Yellow,
+        AgentState::Done => Color::Green,
+        AgentState::Error => Color::Red,
+        AgentState::Idle => Color::Blue,
+    };
+
     let events_pane = Paragraph::new(visible_lines).block(
         Block::default()
             .title(format!(" Agent Events - {:?} ", app.agentstate))
-            .borders(Borders::ALL),
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(event_border_color)),
     );
 
+    let input_border_color = if app.focus == Focus::Input {
+        Color::Rgb(255, 165, 0) // Orange
+    } else {
+        Color::White
+    };
+
     let cursor = if app.cursor_visible { "█" } else { " " };
-    let input_text = format!("{}{}", app.inputbuffer, cursor);
+    let input_text = format!(
+        "{}{}{}",
+        &app.inputbuffer[..app.cursor_pos.min(app.inputbuffer.len())],
+        cursor,
+        &app.inputbuffer[app.cursor_pos.min(app.inputbuffer.len())..]
+    );
     let input_pane = Paragraph::new(input_text)
         .block(
             Block::default()
                 .title(app.current_session_title.as_str())
-                .borders(Borders::ALL),
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(input_border_color)),
         )
         .style(Style::default().fg(Color::LightYellow))
         .wrap(Wrap { trim: false });
@@ -954,12 +1347,18 @@ fn log_entry_to_wrapped_lines(entry: &LogEntry, width: usize) -> Vec<Line<'stati
         LogEntry::Assistant(text) => push_wrapped_log_lines(
             &mut lines,
             Style::default().fg(Color::White),
+            format!("{text}"),
+            width,
+        ),
+        LogEntry::AssistantFinal(text) => push_wrapped_log_lines(
+            &mut lines,
+            Style::default().fg(Color::White),
             format!(
-                "{}Crust Agent:{}\n{}\n{}",
-                "=".repeat(50),
-                "=".repeat(50),
+                "{} FINAL RESPONSE {}\n{}\n{}",
+                "▶".repeat(20),
+                "◀".repeat(20),
                 text,
-                "=".repeat(175),
+                "─".repeat(width.min(80)),
             ),
             width,
         ),
@@ -999,7 +1398,8 @@ fn log_entry_to_wrapped_lines(entry: &LogEntry, width: usize) -> Vec<Line<'stati
 
 async fn emit_session_title(
     sessionmanager: &Arc<Mutex<SessionManager>>,
-    event_tx: &mpsc::Sender<AgentEvent>,
+    session_id: &str,
+    event_tx: &mpsc::Sender<TaggedAgentEvent>,
 ) {
     let title = {
         let sm = sessionmanager.lock().await;
@@ -1007,7 +1407,10 @@ async fn emit_session_title(
     };
     if let Some(title) = title {
         let _ = event_tx
-            .send(AgentEvent::SessionTitleUpdated { title })
+            .send(TaggedAgentEvent {
+                session_id: session_id.to_string(),
+                event: AgentEvent::SessionTitleUpdated { title },
+            })
             .await;
     }
 }
@@ -1015,7 +1418,8 @@ async fn emit_session_title(
 async fn agent_main_run(
     sessionmanager: Arc<Mutex<SessionManager>>,
     prompt: String,
-    event_tx: mpsc::Sender<AgentEvent>,
+    session_id: String,
+    event_tx: mpsc::Sender<TaggedAgentEvent>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let user_message = Message {
         role: Role::User,
@@ -1028,22 +1432,50 @@ async fn agent_main_run(
         let mut sm = sessionmanager.lock().await;
         sm.add_message_to_current(user_message);
     }
-    emit_session_title(&sessionmanager, &event_tx).await;
+    emit_session_title(&sessionmanager, &session_id, &event_tx).await;
 
     let config = {
         let sm = sessionmanager.lock().await;
         sm.get_current_config().unwrap()
     };
 
+    let client = config.client_builder()?;
+    let context_builder = ContextBuilder::default();
+
     for _ in 0..config.max_agent_steps {
-        let current_messages = {
+        let (current_messages, estimated_context_tokens, estimated_context_ratio) = {
             let sm = sessionmanager.lock().await;
-            sm.get_current_session().unwrap().messages.clone()
+            let session = sm.get_current_session().unwrap();
+            let context = context_builder.build_context(session, &config);
+            let estimated_tokens = context_builder.estimate_context_tokens(&context);
+            let estimated_ratio = context_builder.estimated_context_ratio(&context, &config);
+            (
+                context,
+                estimated_tokens,
+                estimated_ratio,
+            )
         };
+
+        if context_builder.should_compact_estimated_context(&current_messages, &config) {
+            let _ = event_tx
+                .send(TaggedAgentEvent {
+                    session_id: session_id.clone(),
+                    event: AgentEvent::SystemNotice {
+                        message: format!(
+                            "Estimated context before request is {}/{} toks ({:.1}%). Run /compact if the next request is slow or fails from context size.",
+                            format_token_count(estimated_context_tokens),
+                            format_token_count(context_builder.context_window_tokens(&config)),
+                            estimated_context_ratio * 100.0,
+                        ),
+                    },
+                })
+                .await;
+        }
 
         let request = openrouter_rs::api::chat::ChatCompletionRequest::builder()
             .model(&config.modelname)
-            .messages(current_messages.clone())
+            .messages(current_messages)
+            .session_id(session_id.clone())
             .typed_tools_batch(&[
                 WebSearchParams::create_tool(),
                 BashParams::create_tool(),
@@ -1053,80 +1485,179 @@ async fn agent_main_run(
             ])
             .temperature(0.2f64)
             .build()?;
-        let client = config.client_builder()?;
-        let response = match client.chat().create(&request).await {
-            Ok(response) => response,
+
+        let mut stream = match client.chat().stream_tool_aware(&request).await {
+            Ok(stream) => stream,
             Err(err) => {
                 let modelname = config.modelname.clone();
                 let _ = event_tx
-                    .send(AgentEvent::Error {
-                        message: format!(
-                            "OpenRouter request failed for model `{modelname}`: {err:?}"
-                        ),
+                    .send(TaggedAgentEvent {
+                        session_id: session_id.clone(),
+                        event: AgentEvent::Error {
+                            message: format!(
+                                "OpenRouter streaming request failed for model `{modelname}`: {err:?}"
+                            ),
+                        },
                     })
                     .await;
                 return Err(Box::new(err) as Box<dyn Error + Send + Sync>);
             }
         };
 
-        if let Some(usage) = &response.usage {
-            {
-                let mut sm = sessionmanager.lock().await;
-                sm.record_usage_to_current(
-                    usage.prompt_tokens,
-                    usage.completion_tokens,
-                    usage.total_tokens,
-                );
-            }
-            emit_session_title(&sessionmanager, &event_tx).await;
-        }
+        let mut final_content = String::new();
+        let mut final_tool_calls = Vec::new();
+        let mut saw_done = false;
+        let mut saw_reasoning_delta = false;
 
-        let Some(choice) = response.choices.first() else {
-            let _ = event_tx
-                .send(AgentEvent::Error {
-                    message: "Crust Agent: No Response quitting.........".to_string(),
-                })
-                .await;
-            break;
-        };
-
-        if let Some(details) = choice.reasoning_details() {
-            for block in details {
-                if let Some(text) = block.content() {
+        while let Some(event) = stream.next().await {
+            match event {
+                StreamEvent::ContentDelta(text) => {
+                    append_delta(&mut final_content, &text);
+                    let _ = event_tx.send(TaggedAgentEvent {
+                        session_id: session_id.clone(),
+                        event: AgentEvent::AssistantDelta { text },
+                    }).await;
+                }
+                StreamEvent::ReasoningDelta(text) => {
+                    saw_reasoning_delta = true;
                     let _ = event_tx
-                        .send(AgentEvent::Thinking {
-                            kind: block.reasoning_type().to_string(),
-                            text: text.to_string(),
+                        .send(TaggedAgentEvent {
+                            session_id: session_id.clone(),
+                            event: AgentEvent::Thinking {
+                                kind: "reasoning".to_string(),
+                                text,
+                            },
                         })
                         .await;
+                }
+                StreamEvent::ReasoningDetailsDelta(details) => {
+                    // ToolAwareStream can expose the same provider reasoning both as a
+                    // plain ReasoningDelta and as structured ReasoningDetailsDelta.
+                    // Showing both creates the repeated tiny blocks in the event pane.
+                    if saw_reasoning_delta {
+                        continue;
+                    }
+
+                    for block in details {
+                        if let Some(text) = block.content() {
+                            let _ = event_tx
+                                .send(TaggedAgentEvent {
+                                    session_id: session_id.clone(),
+                                    event: AgentEvent::Thinking {
+                                        kind: "reasoning".to_string(),
+                                        text: text.to_string(),
+                                    },
+                                })
+                                .await;
+                        }
+                    }
+                }
+                StreamEvent::Done {
+                    tool_calls, usage, ..
+                } => {
+                    saw_done = true;
+                    final_tool_calls = tool_calls;
+
+                    if let Some(usage) = usage {
+                        let prompt_tokens_sent = usage.prompt_tokens;
+                        {
+                            let mut sm = sessionmanager.lock().await;
+                            sm.record_usage_to_current(
+                                usage.prompt_tokens,
+                                usage.completion_tokens,
+                                usage.total_tokens,
+                            );
+                        }
+                        emit_session_title(&sessionmanager, &session_id, &event_tx).await;
+
+                        if let Some(message) =
+                            context_pressure_message(&context_builder, &config, prompt_tokens_sent)
+                        {
+                            let _ = event_tx.send(TaggedAgentEvent {
+                                session_id: session_id.clone(),
+                                event: AgentEvent::SystemNotice { message },
+                            }).await;
+                        }
+                    }
+                }
+                StreamEvent::Error(err) => {
+                    let _ = event_tx
+                        .send(TaggedAgentEvent {
+                            session_id: session_id.clone(),
+                            event: AgentEvent::Error {
+                                message: format!("OpenRouter stream error: {err:?}"),
+                            },
+                        })
+                        .await;
+                    return Err(Box::new(err) as Box<dyn Error + Send + Sync>);
                 }
             }
         }
 
-        if let Some(tool_calls) = choice.tool_calls() {
+        if !saw_done {
+            let _ = event_tx
+                .send(TaggedAgentEvent {
+                    session_id: session_id.clone(),
+                    event: AgentEvent::Error {
+                        message: "Crust Agent: stream ended without a final event.".to_string(),
+                    },
+                })
+                .await;
+            break;
+        }
+
+        if !final_tool_calls.is_empty() {
             {
                 let mut sm = sessionmanager.lock().await;
                 sm.add_message_to_current(Message::assistant_with_tool_calls(
-                    choice.content().unwrap_or(""),
-                    tool_calls.to_vec(),
+                    final_content.as_str(),
+                    final_tool_calls.clone(),
                 ));
             }
-            emit_session_title(&sessionmanager, &event_tx).await;
+            emit_session_title(&sessionmanager, &session_id, &event_tx).await;
 
-            for tool_call in tool_calls {
+            for tool_call in &final_tool_calls {
                 let _ = event_tx
-                    .send(AgentEvent::ToolCallStarted {
-                        name: tool_call.name().to_string(),
-                        args: tool_call.arguments_json().to_string(),
+                    .send(TaggedAgentEvent {
+                        session_id: session_id.clone(),
+                        event: AgentEvent::ToolCallStarted {
+                            name: tool_call.name().to_string(),
+                            args: tool_call.arguments_json().to_string(),
+                        },
                     })
                     .await;
 
-                let tool_result = execute_tool_call(tool_call).await?;
+                let tool_result = match execute_tool_call(tool_call).await {
+                    Ok(result) => result,
+                    Err(err) => {
+                        let error_msg = format!("Tool `{}` failed: {err}", tool_call.name());
+                        let _ = event_tx.send(TaggedAgentEvent {
+                            session_id: session_id.clone(),
+                            event: AgentEvent::Error {
+                                message: error_msg.clone(),
+                            },
+                        }).await;
+                        // Add error as tool response so conversation can continue
+                        {
+                            let mut sm = sessionmanager.lock().await;
+                            sm.add_message_to_current(Message::tool_response_named(
+                                tool_call.id(),
+                                tool_call.name(),
+                                error_msg.clone(),
+                            ));
+                        }
+                        emit_session_title(&sessionmanager, &session_id, &event_tx).await;
+                        continue;
+                    }
+                };
 
                 let _ = event_tx
-                    .send(AgentEvent::ToolCallFinished {
-                        name: tool_call.name().to_string(),
-                        result: tool_result.clone(),
+                    .send(TaggedAgentEvent {
+                        session_id: session_id.clone(),
+                        event: AgentEvent::ToolCallFinished {
+                            name: tool_call.name().to_string(),
+                            result: tool_result.clone(),
+                        },
                     })
                     .await;
 
@@ -1138,28 +1669,33 @@ async fn agent_main_run(
                         tool_result,
                     ));
                 }
-                emit_session_title(&sessionmanager, &event_tx).await;
+                emit_session_title(&sessionmanager, &session_id, &event_tx).await;
             }
 
             continue;
         } else {
-            let final_content = choice.content().unwrap_or("").to_string();
             {
                 let mut sm = sessionmanager.lock().await;
                 sm.add_message_to_current(Message::new(Role::Assistant, final_content.clone()));
             }
-            emit_session_title(&sessionmanager, &event_tx).await;
+            emit_session_title(&sessionmanager, &session_id, &event_tx).await;
 
             let _ = event_tx
-                .send(AgentEvent::AssistantFinal {
-                    text: final_content,
+                .send(TaggedAgentEvent {
+                    session_id: session_id.clone(),
+                    event: AgentEvent::AssistantFinal {
+                        text: final_content,
+                    },
                 })
                 .await;
             return Ok(());
         }
     }
 
-    let _ = event_tx.send(AgentEvent::MaxStepsReached).await;
+    let _ = event_tx.send(TaggedAgentEvent {
+        session_id: session_id.clone(),
+        event: AgentEvent::MaxStepsReached,
+    }).await;
     Ok(())
 }
 

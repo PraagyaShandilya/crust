@@ -1,3 +1,4 @@
+use crate::context::{content_to_compaction_text, truncate_middle};
 use openrouter_rs::{OpenRouterClient, api::chat::Message, types::Role};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -55,6 +56,10 @@ pub struct Session {
     pub sysprompt: Message,
     pub config: Config,
     #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub compacted_until: usize,
+    #[serde(default)]
     pub latest_prompt_tokens: u32,
     #[serde(default)]
     pub latest_completion_tokens: u32,
@@ -82,6 +87,8 @@ impl Session {
             messages,
             sysprompt,
             config,
+            summary: None,
+            compacted_until: 0,
             latest_prompt_tokens: 0,
             latest_completion_tokens: 0,
             latest_total_tokens: 0,
@@ -113,7 +120,60 @@ impl Session {
     pub fn clear_messages(&mut self) {
         self.messages.clear();
         self.messages.push(self.sysprompt.clone());
+        self.summary = None;
+        self.compacted_until = 0;
         self.touch();
+    }
+
+    pub fn compact_to_recent(&mut self, min_recent_messages: usize) -> Result<usize, String> {
+        let cutoff = self.messages.len().saturating_sub(min_recent_messages);
+        if cutoff <= self.compacted_until + 1 {
+            return Err("Not enough uncompacted history to compact.".to_string());
+        }
+
+        let mut summary = String::new();
+        if let Some(existing_summary) = self
+            .summary
+            .as_deref()
+            .filter(|summary| !summary.trim().is_empty())
+        {
+            summary.push_str("Previous compacted summary:\n");
+            summary.push_str(existing_summary.trim());
+            summary.push_str("\n\nNewly compacted transcript notes:\n");
+        } else {
+            summary.push_str("Compacted transcript notes:\n");
+        }
+
+        for (index, message) in self
+            .messages
+            .iter()
+            .enumerate()
+            .skip(self.compacted_until)
+            .take(cutoff.saturating_sub(self.compacted_until))
+        {
+            if message.role == Role::System {
+                continue;
+            }
+
+            let content = content_to_compaction_text(&message.content, 1_500);
+            summary.push_str(&format!(
+                "\n[{}] {}: {}",
+                index,
+                message.role,
+                content.trim()
+            ));
+
+            if let Some(tool_calls) = &message.tool_calls {
+                let calls = serde_json::to_string(tool_calls).unwrap_or_default();
+                summary.push_str("\n  tool_calls: ");
+                summary.push_str(&truncate_middle(&calls, 1_000));
+            }
+        }
+
+        self.summary = Some(truncate_middle(&summary, 40_000));
+        self.compacted_until = cutoff;
+        self.touch();
+        Ok(cutoff)
     }
     pub fn get_config(&self) -> Config {
         self.config.clone()
@@ -161,10 +221,6 @@ impl SessionManager {
         self.save_sessions();
 
         self.get_current_session().unwrap()
-    }
-
-    pub fn list_sessions(&self) -> Vec<&Session> {
-        self.sessions.values().collect()
     }
 
     pub fn list_session_names(&self) -> Vec<&str> {
@@ -254,6 +310,18 @@ impl SessionManager {
             session.clear_messages();
             self.save_sessions();
         }
+    }
+
+    pub fn compact_current_session_to_recent(
+        &mut self,
+        min_recent_messages: usize,
+    ) -> Result<usize, String> {
+        let cutoff = self
+            .get_current_session_mut()
+            .ok_or_else(|| "No current session.".to_string())?
+            .compact_to_recent(min_recent_messages)?;
+        self.save_sessions();
+        Ok(cutoff)
     }
 
     fn save_sessions(&self) {
