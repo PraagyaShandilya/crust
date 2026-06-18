@@ -9,20 +9,23 @@ use openrouter_rs::{
     api::chat::Message,
     types::{Role, ToolCall, stream::StreamEvent, typed_tool::TypedTool},
 };
-use rsbash::rashf;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use session::{Session, SessionManager};
 use std::{
+    env,
     error::Error,
     io::{self, Write},
+    path::{Component, Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
 use tavily::Tavily;
+use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
+use tokio::time;
 
 use ratatui::{
     Frame, Terminal,
@@ -44,7 +47,7 @@ use ratatui::{
 // setup for tui
 #[derive(Debug)]
 pub struct App {
-    system_message: &'static str,
+    system_message: String,
     sessionmanager: Arc<Mutex<SessionManager>>,
     current_session_id: String,
     current_session_title: String,
@@ -105,8 +108,8 @@ pub enum AgentEvent {
 #[derive(Debug, Clone)]
 pub enum LogEntry {
     User(String),
-    Assistant(String),        // In-progress streaming
-    AssistantFinal(String),   // Completed final response
+    Assistant(String),      // In-progress streaming
+    AssistantFinal(String), // Completed final response
     Thinking { kind: String, text: String },
     ToolCall { name: String, args: String },
     ToolResult { name: String, result: String },
@@ -238,13 +241,164 @@ fn format_current_session_title(session: &Session) -> String {
     )
 }
 
+fn build_system_message() -> String {
+    let shell = ShellKind::from_env().unwrap_or_else(|_| ShellKind::default_for_current_os());
+    format!(
+        "You are an AI agent given tools to help people. Use the shell tool to run {shell_name} commands in the workspace, the read/write/edit tools for files when you know filenames, and the web search tool to interface with the web.",
+        shell_name = shell.display_name()
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellKind {
+    Bash,
+    PowerShell,
+    Cmd,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShellResult {
+    exitcode: i32,
+    output: String,
+    error: String,
+}
+
+impl ShellKind {
+    fn from_env() -> Result<Self, String> {
+        let value = env::var("CRUST_SHELL").unwrap_or_else(|_| "auto".to_string());
+        Self::from_config(&value, cfg!(windows))
+    }
+
+    fn from_config(value: &str, is_windows: bool) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "auto" => Ok(Self::default_for_os(is_windows)),
+            "bash" => Ok(Self::Bash),
+            "powershell" | "pwsh" => Ok(Self::PowerShell),
+            "cmd" => Ok(Self::Cmd),
+            other => Err(format!(
+                "Unsupported CRUST_SHELL value `{other}`. Use auto, bash, powershell, or cmd."
+            )),
+        }
+    }
+
+    fn default_for_current_os() -> Self {
+        Self::default_for_os(cfg!(windows))
+    }
+
+    fn default_for_os(is_windows: bool) -> Self {
+        if is_windows {
+            Self::PowerShell
+        } else {
+            Self::Bash
+        }
+    }
+
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::Bash => "Bash",
+            Self::PowerShell => "PowerShell",
+            Self::Cmd => "cmd.exe",
+        }
+    }
+
+    fn command(self, command: &str) -> Command {
+        let mut process = match self {
+            Self::Bash => {
+                let mut process = Command::new("bash");
+                process.arg("-lc").arg(command);
+                process
+            }
+            Self::PowerShell => {
+                let mut process = Command::new("powershell.exe");
+                process.arg("-NoProfile").arg("-Command").arg(command);
+                process
+            }
+            Self::Cmd => {
+                let mut process = Command::new("cmd.exe");
+                process.arg("/C").arg(command);
+                process
+            }
+        };
+        process.kill_on_drop(true);
+        process
+    }
+}
+
+async fn run_shell_command(
+    shell: ShellKind,
+    command: &str,
+    timeout_duration: Duration,
+) -> Result<ShellResult, Box<dyn Error + Send + Sync>> {
+    let mut process = shell.command(command);
+    let output = match time::timeout(timeout_duration, process.output()).await {
+        Ok(output) => output?,
+        Err(_) => {
+            let error = format!(
+                "Command timed out after {} ms.",
+                timeout_duration.as_millis()
+            );
+            return Ok(ShellResult {
+                exitcode: -1,
+                output: String::new(),
+                error,
+            });
+        }
+    };
+
+    Ok(ShellResult {
+        exitcode: output.status.code().unwrap_or(-1),
+        output: String::from_utf8_lossy(&output.stdout).to_string(),
+        error: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
+}
+
+fn normalize_tool_path(filename: &str) -> PathBuf {
+    let converted = convert_windows_unix_style_path(filename);
+    let path = Path::new(&converted);
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        if component == Component::CurDir {
+            continue;
+        }
+        normalized.push(component.as_os_str());
+    }
+
+    if normalized.as_os_str().is_empty() {
+        PathBuf::from(filename)
+    } else {
+        normalized
+    }
+}
+
+fn convert_windows_unix_style_path(filename: &str) -> String {
+    if !cfg!(windows) {
+        return filename.to_string();
+    }
+
+    let normalized_slashes = filename.replace('\\', "/");
+    let bytes = normalized_slashes.as_bytes();
+    if bytes.len() >= 7
+        && normalized_slashes[..5].eq_ignore_ascii_case("/mnt/")
+        && bytes[5].is_ascii_alphabetic()
+        && bytes[6] == b'/'
+    {
+        let drive = char::from(bytes[5]).to_ascii_uppercase();
+        return format!("{drive}:{}", &normalized_slashes[6..]);
+    }
+
+    if bytes.len() >= 4 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b'/' {
+        let drive = char::from(bytes[1]).to_ascii_uppercase();
+        return format!("{drive}:{}", &normalized_slashes[2..]);
+    }
+
+    filename.to_string()
+}
+
 impl App {
     pub fn new() -> Self {
         // Initialize messages with system prompt
-        let system_message = r#"You are an AI agent given tools to be able to help people you can use the
-        bash tool to run unix commands in the shell, the read write and edit tools
-        respectively for editing files that you know the filenames of and the web search
-        tool to interface with the web."#;
+        let system_message = build_system_message();
 
         // Initialize Session Manager
         let mut session_manager = SessionManager::new();
@@ -275,7 +429,7 @@ impl App {
             initial_scroll = usize::MAX;
         } else {
             let default_session =
-                session_manager.create_session("Default".to_string(), system_message);
+                session_manager.create_session("Default".to_string(), &system_message);
             current_session_title = format_current_session_title(default_session);
             current_session_id = default_session.id.clone();
             eventlog.push(LogEntry::System(format!(
@@ -513,20 +667,20 @@ impl TypedTool for WebSearchParams {
     }
 }
 
-// tool setup for bash commands
+// tool setup for shell commands
 #[derive(Debug, Serialize, Deserialize, Clone, JsonSchema)]
-struct BashParams {
+struct ShellParams {
     timeout: u32,
     command: String,
 }
 
-impl TypedTool for BashParams {
+impl TypedTool for ShellParams {
     fn name() -> &'static str {
-        "bash_calling_tool"
+        "shell_calling_tool"
     }
 
     fn description() -> &'static str {
-        "Run a predefined bash command in the shell in of the workspace"
+        "Run a command in the configured workspace shell"
     }
 }
 
@@ -811,8 +965,13 @@ where
                         let tx = agent_tx.clone();
                         let spawn_session_id = current_session_id.clone();
                         app.agent_task = Some(tokio::spawn(async move {
-                            if let Err(err) =
-                                agent_main_run(sessionmanager, prompt, current_session_id, tx.clone()).await
+                            if let Err(err) = agent_main_run(
+                                sessionmanager,
+                                prompt,
+                                current_session_id,
+                                tx.clone(),
+                            )
+                            .await
                             {
                                 let _ = tx
                                     .send(TaggedAgentEvent {
@@ -823,10 +982,12 @@ where
                                     })
                                     .await;
                             }
-                            let _ = tx.send(TaggedAgentEvent {
-                                session_id: spawn_session_id,
-                                event: AgentEvent::Finished,
-                            }).await;
+                            let _ = tx
+                                .send(TaggedAgentEvent {
+                                    session_id: spawn_session_id,
+                                    event: AgentEvent::Finished,
+                                })
+                                .await;
                         }));
                         continue;
                     }
@@ -852,8 +1013,7 @@ where
                                 let max = filtered.len().saturating_sub(1);
                                 app.slash_command_selected =
                                     (app.slash_command_selected + 1).min(max);
-                                app.sidebar_scroll =
-                                    (app.sidebar_scroll + 1).min(max as u16);
+                                app.sidebar_scroll = (app.sidebar_scroll + 1).min(max as u16);
                             } else {
                                 app.event_scroll = app.event_scroll.saturating_add(1);
                                 app.follow_mode = false;
@@ -875,8 +1035,7 @@ where
                                 let max = filtered.len().saturating_sub(1);
                                 app.slash_command_selected =
                                     (app.slash_command_selected + 5).min(max);
-                                app.sidebar_scroll =
-                                    (app.sidebar_scroll + 5).min(max as u16);
+                                app.sidebar_scroll = (app.sidebar_scroll + 5).min(max as u16);
                             } else {
                                 app.event_scroll = app.event_scroll.saturating_add(10);
                                 app.follow_mode = false;
@@ -979,7 +1138,7 @@ async fn handle_session_command(app: &mut App, prompt: &str) -> bool {
             )));
             return true;
         }
-        let new_session = sessionmanager.create_session(session_name, app.system_message);
+        let new_session = sessionmanager.create_session(session_name, &app.system_message);
         app.current_session_title = format_current_session_title(new_session);
         app.eventlog.push(LogEntry::System(format!(
             "Created and switched to new session: {} ({})",
@@ -1065,9 +1224,9 @@ async fn handle_session_command(app: &mut App, prompt: &str) -> bool {
                     }
                 }
                 match sessionmanager.delete_session(&session_id) {
-                    Ok(_) => app.eventlog.push(LogEntry::System(format!(
-                        "Deleted session: {session_name}"
-                    ))),
+                    Ok(_) => app
+                        .eventlog
+                        .push(LogEntry::System(format!("Deleted session: {session_name}"))),
                     Err(e) => app.eventlog.push(LogEntry::Error(format!("Error: {e}"))),
                 }
             }
@@ -1083,7 +1242,8 @@ async fn handle_session_command(app: &mut App, prompt: &str) -> bool {
         // Block session switching while agent is running
         if app.agent_task.is_some() {
             app.eventlog.push(LogEntry::Error(
-                "Cannot switch sessions while agent is running. Press Esc to cancel first.".to_string(),
+                "Cannot switch sessions while agent is running. Press Esc to cancel first."
+                    .to_string(),
             ));
             return true;
         }
@@ -1449,11 +1609,7 @@ async fn agent_main_run(
             let context = context_builder.build_context(session, &config);
             let estimated_tokens = context_builder.estimate_context_tokens(&context);
             let estimated_ratio = context_builder.estimated_context_ratio(&context, &config);
-            (
-                context,
-                estimated_tokens,
-                estimated_ratio,
-            )
+            (context, estimated_tokens, estimated_ratio)
         };
 
         if context_builder.should_compact_estimated_context(&current_messages, &config) {
@@ -1478,7 +1634,7 @@ async fn agent_main_run(
             .session_id(session_id.clone())
             .typed_tools_batch(&[
                 WebSearchParams::create_tool(),
-                BashParams::create_tool(),
+                ShellParams::create_tool(),
                 ReadFileParams::create_tool(),
                 EditFileParams::create_tool(),
                 WriteFileParams::create_tool(),
@@ -1513,10 +1669,12 @@ async fn agent_main_run(
             match event {
                 StreamEvent::ContentDelta(text) => {
                     append_delta(&mut final_content, &text);
-                    let _ = event_tx.send(TaggedAgentEvent {
-                        session_id: session_id.clone(),
-                        event: AgentEvent::AssistantDelta { text },
-                    }).await;
+                    let _ = event_tx
+                        .send(TaggedAgentEvent {
+                            session_id: session_id.clone(),
+                            event: AgentEvent::AssistantDelta { text },
+                        })
+                        .await;
                 }
                 StreamEvent::ReasoningDelta(text) => {
                     saw_reasoning_delta = true;
@@ -1573,10 +1731,12 @@ async fn agent_main_run(
                         if let Some(message) =
                             context_pressure_message(&context_builder, &config, prompt_tokens_sent)
                         {
-                            let _ = event_tx.send(TaggedAgentEvent {
-                                session_id: session_id.clone(),
-                                event: AgentEvent::SystemNotice { message },
-                            }).await;
+                            let _ = event_tx
+                                .send(TaggedAgentEvent {
+                                    session_id: session_id.clone(),
+                                    event: AgentEvent::SystemNotice { message },
+                                })
+                                .await;
                         }
                     }
                 }
@@ -1631,12 +1791,14 @@ async fn agent_main_run(
                     Ok(result) => result,
                     Err(err) => {
                         let error_msg = format!("Tool `{}` failed: {err}", tool_call.name());
-                        let _ = event_tx.send(TaggedAgentEvent {
-                            session_id: session_id.clone(),
-                            event: AgentEvent::Error {
-                                message: error_msg.clone(),
-                            },
-                        }).await;
+                        let _ = event_tx
+                            .send(TaggedAgentEvent {
+                                session_id: session_id.clone(),
+                                event: AgentEvent::Error {
+                                    message: error_msg.clone(),
+                                },
+                            })
+                            .await;
                         // Add error as tool response so conversation can continue
                         {
                             let mut sm = sessionmanager.lock().await;
@@ -1692,10 +1854,12 @@ async fn agent_main_run(
         }
     }
 
-    let _ = event_tx.send(TaggedAgentEvent {
-        session_id: session_id.clone(),
-        event: AgentEvent::MaxStepsReached,
-    }).await;
+    let _ = event_tx
+        .send(TaggedAgentEvent {
+            session_id: session_id.clone(),
+            event: AgentEvent::MaxStepsReached,
+        })
+        .await;
     Ok(())
 }
 
@@ -1749,17 +1913,23 @@ async fn execute_tool_call(tc: &ToolCall) -> Result<String, Box<dyn Error + Send
 
         return Ok(serde_json::to_string_pretty(&websearch)?);
     }
-    // Bash Tool exec
+    // Shell Tool exec
 
-    if tc.is_tool::<BashParams>() {
-        let params = tc.parse_params::<BashParams>()?;
-        let (exitcode, output, error) = rashf!("timeout {} {}", params.timeout, params.command)?;
-        let bashresults = json!({
-            "exitcode":exitcode,
-            "output":output,
-            "error":error,
+    if tc.is_tool::<ShellParams>() {
+        let params = tc.parse_params::<ShellParams>()?;
+        let shell = ShellKind::from_env()?;
+        let result = run_shell_command(
+            shell,
+            &params.command,
+            Duration::from_secs(params.timeout.into()),
+        )
+        .await?;
+        let shellresults = json!({
+            "exitcode":result.exitcode,
+            "output":result.output,
+            "error":result.error,
         });
-        return Ok(serde_json::to_string_pretty(&bashresults)?);
+        return Ok(serde_json::to_string_pretty(&shellresults)?);
     }
 
     if tc.is_tool::<ReadFileParams>() {
@@ -1769,13 +1939,14 @@ async fn execute_tool_call(tc: &ToolCall) -> Result<String, Box<dyn Error + Send
 
         let params = tc.parse_params::<ReadFileParams>()?;
         let filename = params.filename.clone();
+        let filepath = normalize_tool_path(&filename);
         let start_line = params.offset.unwrap_or(1).max(1);
         let max_lines = params
             .limit
             .unwrap_or(DEFAULT_MAX_LINES)
             .clamp(1, MAX_LINES);
 
-        let raw_content = std::fs::read_to_string(&filename)?;
+        let raw_content = std::fs::read_to_string(&filepath)?;
         let all_lines: Vec<&str> = raw_content.lines().collect();
         let total_lines = all_lines.len();
         let file_size = raw_content.len();
@@ -1846,7 +2017,8 @@ async fn execute_tool_call(tc: &ToolCall) -> Result<String, Box<dyn Error + Send
         let params = tc.parse_params::<WriteFileParams>()?;
         let filename = params.filename;
         let content = params.content;
-        let file = std::fs::File::create(&filename)?;
+        let filepath = normalize_tool_path(&filename);
+        let file = std::fs::File::create(&filepath)?;
         let mut writer = std::io::BufWriter::new(file);
         writer.write_all(content.as_bytes())?;
 
@@ -1858,15 +2030,16 @@ async fn execute_tool_call(tc: &ToolCall) -> Result<String, Box<dyn Error + Send
 
     if tc.is_tool::<EditFileParams>() {
         let params = tc.parse_params::<EditFileParams>()?;
+        let filepath = normalize_tool_path(&params.filename);
 
-        let mut buf = std::fs::read_to_string(&params.filename)?;
+        let mut buf = std::fs::read_to_string(&filepath)?;
 
         if let Some(offset) = buf.find(&params.oldcontent) {
             let end = offset + params.oldcontent.len();
 
             buf.replace_range(offset..end, &params.newcontent);
 
-            std::fs::write(&params.filename, buf)?;
+            std::fs::write(&filepath, buf)?;
 
             let editfileresults = json!({
                 "err" :"false",
