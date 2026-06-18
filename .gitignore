@@ -4,6 +4,7 @@
 debug
 target
 .crust_sessions/
+.agents/
 scripts/
 
 # Environment files

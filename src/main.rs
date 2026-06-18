@@ -738,6 +738,8 @@ impl TypedTool for EditFileParams {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    session::load_env();
+
     // setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -1868,8 +1870,7 @@ async fn execute_tool_call(tc: &ToolCall) -> Result<String, Box<dyn Error + Send
 
     if tc.is_tool::<WebSearchParams>() {
         let params = tc.parse_params::<WebSearchParams>()?;
-        dotenvy::dotenv().ok();
-        dotenvy::from_filename(concat!(env!("CARGO_MANIFEST_DIR"), "/.env")).ok();
+        session::load_env();
         let tavily_api_key = std::env::var("TAVILY_API_KEY")?;
         let tavily = Tavily::builder(tavily_api_key)
             .timeout(Duration::from_secs(45))

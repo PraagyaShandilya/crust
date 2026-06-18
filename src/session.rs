@@ -8,6 +8,18 @@ use std::fs;
 use std::path::PathBuf;
 use uuid::Uuid;
 
+pub fn load_env() {
+    // Load .env from the current directory, the compiled project root, or next to the binary.
+    dotenvy::dotenv().ok();
+    dotenvy::from_filename(concat!(env!("CARGO_MANIFEST_DIR"), "/.env")).ok();
+
+    if let Ok(exe_path) = env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            dotenvy::from_path(exe_dir.join(".env")).ok();
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub max_agent_steps: u32,
@@ -16,9 +28,7 @@ pub struct Config {
 
 impl Config {
     pub fn new() -> Self {
-        // Load .env from the current directory, falling back to the project root.
-        dotenvy::dotenv().ok();
-        dotenvy::from_filename(concat!(env!("CARGO_MANIFEST_DIR"), "/.env")).ok();
+        load_env();
 
         let max_agent_steps = env::var("MAX_AGENT_STEPS")
             .unwrap_or("10".to_string())
@@ -36,6 +46,7 @@ impl Config {
     }
 
     pub fn client_builder(&self) -> Result<OpenRouterClient, Box<dyn Error + Send + Sync>> {
+        load_env();
         let api_key = env::var("OPENROUTER_API_KEY").expect("OPENROUTER_API_KEY must be set");
         let client = OpenRouterClient::builder()
             .api_key(api_key.clone())
