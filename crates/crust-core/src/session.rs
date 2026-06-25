@@ -67,6 +67,18 @@ impl SessionManager {
             .collect()
     }
 
+    pub fn list_sessions(&self) -> Vec<Session> {
+        self.sessions.values().cloned().collect()
+    }
+
+    pub fn get_session(&self, session_id: &str) -> Option<&Session> {
+        self.sessions.get(session_id)
+    }
+
+    pub fn get_session_mut(&mut self, session_id: &str) -> Option<&mut Session> {
+        self.sessions.get_mut(session_id)
+    }
+
     pub fn find_session_id_by_name(&self, session_name: &str) -> Option<String> {
         self.sessions
             .values()
@@ -135,6 +147,21 @@ impl SessionManager {
         true
     }
 
+    pub fn record_usage_to_session(
+        &mut self,
+        session_id: &str,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        total_tokens: u32,
+    ) -> bool {
+        let Some(session) = self.sessions.get_mut(session_id) else {
+            return false;
+        };
+        session.record_usage(prompt_tokens, completion_tokens, total_tokens);
+        self.save_sessions();
+        true
+    }
+
     pub fn record_usage_to_current(
         &mut self,
         prompt_tokens: u32,
@@ -153,6 +180,10 @@ impl SessionManager {
         } else {
             return None;
         }
+    }
+
+    pub fn get_session_config(&self, session_id: &str) -> Option<Config> {
+        self.sessions.get(session_id).map(Session::get_config)
     }
 
     pub fn clear_current_session(&mut self) {

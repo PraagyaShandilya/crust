@@ -31,7 +31,7 @@ async fn emit_session_title(
 ) {
     let title = {
         let sm = sessionmanager.lock().await;
-        sm.get_current_session().map(format_current_session_title)
+        sm.get_session(session_id).map(format_current_session_title)
     };
     if let Some(title) = title {
         let _ = event_tx
@@ -58,17 +58,20 @@ pub async fn agent_main_run(
     };
     {
         let mut sm = sessionmanager.lock().await;
-        sm.add_message_to_current(user_message);
+        if !sm.add_message_to_session(&session_id, user_message) {
+            return Err(format!("Session '{session_id}' not found").into());
+        }
     }
     emit_session_title(&sessionmanager, &session_id, &event_tx).await;
 
     let mut config = {
         let sm = sessionmanager.lock().await;
-        sm.get_current_config().unwrap()
+        sm.get_session_config(&session_id)
+            .ok_or_else(|| format!("Session '{session_id}' not found"))?
     };
     let core = {
         let sm = sessionmanager.lock().await;
-        sm.get_current_session()
+        sm.get_session(&session_id)
             .map(|session| core_profile(session.core_profile))
             .unwrap_or_else(|| core_profile(Default::default()))
     };
@@ -82,7 +85,9 @@ pub async fn agent_main_run(
     for _step in 0..config.max_agent_steps {
         let (current_messages, estimated_context_tokens, estimated_context_ratio) = {
             let sm = sessionmanager.lock().await;
-            let session = sm.get_current_session().unwrap();
+            let session = sm
+                .get_session(&session_id)
+                .ok_or_else(|| format!("Session '{session_id}' not found"))?;
             let context = context_builder.build_context(session, &config);
             let estimated_tokens = context_builder.estimate_context_tokens(&context);
             let estimated_ratio = context_builder.estimated_context_ratio(&context, &config);
@@ -221,7 +226,8 @@ pub async fn agent_main_run(
                         let prompt_tokens_sent = usage.prompt_tokens;
                         {
                             let mut sm = sessionmanager.lock().await;
-                            sm.record_usage_to_current(
+                            sm.record_usage_to_session(
+                                &session_id,
                                 usage.prompt_tokens,
                                 usage.completion_tokens,
                                 usage.total_tokens,
@@ -270,10 +276,13 @@ pub async fn agent_main_run(
         if !final_tool_calls.is_empty() {
             {
                 let mut sm = sessionmanager.lock().await;
-                sm.add_message_to_current(Message::assistant_with_tool_calls(
-                    final_content.as_str(),
-                    final_tool_calls.clone(),
-                ));
+                sm.add_message_to_session(
+                    &session_id,
+                    Message::assistant_with_tool_calls(
+                        final_content.as_str(),
+                        final_tool_calls.clone(),
+                    ),
+                );
             }
             emit_session_title(&sessionmanager, &session_id, &event_tx).await;
 
@@ -302,11 +311,14 @@ pub async fn agent_main_run(
                             .await;
                         {
                             let mut sm = sessionmanager.lock().await;
-                            sm.add_message_to_current(Message::tool_response_named(
-                                tool_call.id(),
-                                tool_call.name(),
-                                error_msg.clone(),
-                            ));
+                            sm.add_message_to_session(
+                                &session_id,
+                                Message::tool_response_named(
+                                    tool_call.id(),
+                                    tool_call.name(),
+                                    error_msg.clone(),
+                                ),
+                            );
                         }
                         emit_session_title(&sessionmanager, &session_id, &event_tx).await;
                         continue;
@@ -325,11 +337,10 @@ pub async fn agent_main_run(
 
                 {
                     let mut sm = sessionmanager.lock().await;
-                    sm.add_message_to_current(Message::tool_response_named(
-                        tool_call.id(),
-                        tool_call.name(),
-                        tool_result,
-                    ));
+                    sm.add_message_to_session(
+                        &session_id,
+                        Message::tool_response_named(tool_call.id(), tool_call.name(), tool_result),
+                    );
                 }
                 emit_session_title(&sessionmanager, &session_id, &event_tx).await;
             }
@@ -338,7 +349,10 @@ pub async fn agent_main_run(
         } else {
             {
                 let mut sm = sessionmanager.lock().await;
-                sm.add_message_to_current(Message::new(Role::Assistant, final_content.clone()));
+                sm.add_message_to_session(
+                    &session_id,
+                    Message::new(Role::Assistant, final_content.clone()),
+                );
             }
             emit_session_title(&sessionmanager, &session_id, &event_tx).await;
 
