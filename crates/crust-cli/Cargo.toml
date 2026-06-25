@@ -1,0 +1,11 @@
+[package]
+name = "crust-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = "0.4"
+crust-core = { path = "../crust-core" }
+crust-types = { path = "../crust-types" }
+tokio = { version = "1.52.1", features = ["full"] }
+uuid = { version = "1.0", features = ["v4", "serde"] }
