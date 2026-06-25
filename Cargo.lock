@@ -246,19 +246,19 @@ dependencies = [
 name = "crust"
 version = "0.1.0"
 dependencies = [
+ "crust-cli",
+ "crust-tui",
+ "crust-types",
+ "tokio",
+]
+
+[[package]]
+name = "crust-cli"
+version = "0.1.0"
+dependencies = [
  "chrono",
- "crossterm",
  "crust-core",
  "crust-types",
- "dotenvy",
- "futures-util",
- "openrouter-rs",
- "ratatui",
- "reqwest",
- "schemars",
- "serde",
- "serde_json",
- "tavily",
  "tokio",
  "uuid",
 ]
@@ -275,6 +275,19 @@ dependencies = [
  "serde",
  "serde_json",
  "tavily",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "crust-tui"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "crust-core",
+ "crust-types",
+ "openrouter-rs",
+ "ratatui",
  "tokio",
  "uuid",
 ]
