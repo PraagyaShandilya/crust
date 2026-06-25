@@ -3,6 +3,9 @@
 /target
 debug
 target
+node_modules/
+dist/
+*.tsbuildinfo
 .crust_sessions/
 .crust_langgraph/
 .crust_spaces/
