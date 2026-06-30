@@ -7,7 +7,7 @@ use tokio::task::JoinHandle;
 
 use crate::tui::log_entry_to_wrapped_lines;
 use crust_core::{
-    SettingsManager, append_delta, context, core_profile, format_current_session_title,
+    CrustSettings, SettingsManager, append_delta, context, core_profile, format_current_session_title,
     session::SessionManager,
 };
 
@@ -47,6 +47,9 @@ pub struct App {
     pub(crate) sidebar_scroll: u16,
     pub(crate) sidebar_selected: usize,
     pub(crate) slash_command_selected: usize,
+    pub(crate) settings_selected_field: usize,
+    pub(crate) settings_draft: CrustSettings,
+    pub(crate) settings_input_buffer: String,
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +86,7 @@ pub enum Focus {
     #[default]
     Input,
     Sidebar,
+    Events,
 }
 
 fn session_input_history(session: &Session) -> Vec<String> {
@@ -190,6 +194,9 @@ impl App {
             sidebar_scroll: 0,
             sidebar_selected: 0,
             slash_command_selected: 0,
+            settings_selected_field: 0,
+            settings_draft: settings.clone(),
+            settings_input_buffer: String::new(),
         }
     }
 

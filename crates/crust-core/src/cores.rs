@@ -20,7 +20,7 @@ pub fn core_profile(kind: CoreKind) -> CoreProfile {
     match kind {
         CoreKind::General => CoreProfile {
             kind,
-            display_name: "General",
+            display_name: "Build",
             description: "Autonomous general-purpose coding agent.",
             system_prompt: general_system_prompt(),
             interaction_mode: InteractionMode::Autonomous,

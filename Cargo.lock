@@ -336,12 +336,14 @@ name = "crust-gateway"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "chrono",
  "crust-core",
  "crust-types",
  "futures-util",
  "serde",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

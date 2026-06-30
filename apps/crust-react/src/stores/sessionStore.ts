@@ -1,14 +1,19 @@
 import { create } from 'zustand';
 import type { ChatEvent, ChatMessage, SessionSummary, ToolCall } from '../types/chat';
 
+export type AgentState = 'idle' | 'thinking' | 'tool' | 'done' | 'error';
+
 interface SessionState {
   sessions: SessionSummary[];
   activeSessionId?: string;
   messagesBySession: Record<string, ChatMessage[]>;
+  agentState: AgentState;
   setSessions: (sessions: SessionSummary[]) => void;
   setActiveSession: (sessionId: string) => void;
   setMessages: (sessionId: string, messages: ChatMessage[]) => void;
   appendMessage: (message: ChatMessage) => void;
+  removeSession: (sessionId: string) => void;
+  updateSession: (sessionId: string, updates: Partial<SessionSummary>) => void;
   applyEvent: (event: ChatEvent) => void;
 }
 
@@ -26,6 +31,7 @@ function upsertToolCall(toolCalls: ToolCall[] | undefined, next: ToolCall): Tool
 export const useSessionStore = create<SessionState>((set) => ({
   sessions: [],
   messagesBySession: {},
+  agentState: 'idle',
 
   setSessions: (sessions) =>
     set((state) => ({
@@ -33,7 +39,7 @@ export const useSessionStore = create<SessionState>((set) => ({
       activeSessionId: state.activeSessionId ?? sessions[0]?.id,
     })),
 
-  setActiveSession: (sessionId) => set({ activeSessionId: sessionId }),
+  setActiveSession: (sessionId) => set({ activeSessionId: sessionId, agentState: 'idle' }),
 
   setMessages: (sessionId, messages) =>
     set((state) => ({
@@ -51,6 +57,25 @@ export const useSessionStore = create<SessionState>((set) => ({
       },
     })),
 
+  removeSession: (sessionId) =>
+    set((state) => {
+      const sessions = state.sessions.filter((s) => s.id !== sessionId);
+      const messagesBySession = { ...state.messagesBySession };
+      delete messagesBySession[sessionId];
+      const activeSessionId =
+        state.activeSessionId === sessionId
+          ? sessions[0]?.id
+          : state.activeSessionId;
+      return { sessions, messagesBySession, activeSessionId };
+    }),
+
+  updateSession: (sessionId, updates) =>
+    set((state) => ({
+      sessions: state.sessions.map((s) =>
+        s.id === sessionId ? { ...s, ...updates } : s,
+      ),
+    })),
+
   applyEvent: (event) =>
     set((state) => {
       if (event.type === 'session.updated') {
@@ -59,21 +84,39 @@ export const useSessionStore = create<SessionState>((set) => ({
         };
       }
 
+      let agentState = state.agentState;
+
       if (event.type === 'message.created') {
+        const existing = state.messagesBySession[event.message.sessionId] ?? [];
+        if (existing.some((m) => m.id === event.message.id)) {
+          return {};
+        }
+        if (event.message.role === 'user') {
+          agentState = 'thinking';
+        }
         return {
+          agentState,
           messagesBySession: {
             ...state.messagesBySession,
-            [event.message.sessionId]: [...(state.messagesBySession[event.message.sessionId] ?? []), event.message],
+            [event.message.sessionId]: [...existing, event.message],
           },
         };
       }
 
-      if (event.type === 'stream.completed' || event.type === 'stream.error') {
-        return {
-          sessions: state.sessions.map((session) =>
-            session.id === event.sessionId ? { ...session, status: event.type === 'stream.error' ? 'error' : 'idle' } : session,
-          ),
-        };
+      if (event.type === 'thinking.delta' || event.type === 'thinking.updated') {
+        agentState = 'thinking';
+      }
+
+      if (event.type === 'tool_call.updated') {
+        agentState = 'tool';
+      }
+
+      if (event.type === 'stream.completed') {
+        agentState = 'done';
+      }
+
+      if (event.type === 'stream.error') {
+        agentState = 'error';
       }
 
       const messagesBySession = Object.fromEntries(
@@ -86,6 +129,17 @@ export const useSessionStore = create<SessionState>((set) => ({
 
             if (event.type === 'message.delta') {
               return { ...message, content: `${message.content}${event.delta}` };
+            }
+
+            if (event.type === 'thinking.delta') {
+              const existing = message.thinking;
+              return {
+                ...message,
+                thinking: {
+                  summary: existing ? `${existing.summary}${event.delta}` : event.delta,
+                  startedAt: existing?.startedAt ?? new Date().toISOString(),
+                },
+              };
             }
 
             if (event.type === 'thinking.updated') {
@@ -101,6 +155,6 @@ export const useSessionStore = create<SessionState>((set) => ({
         ]),
       );
 
-      return { messagesBySession };
+      return { messagesBySession, agentState };
     }),
 }));

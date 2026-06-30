@@ -96,6 +96,25 @@ impl SessionManager {
         }
     }
 
+    pub fn rename_session(&mut self, session_id: &str, name: String) -> Result<(), String> {
+        if !self.sessions.contains_key(session_id) {
+            return Err(format!("Session '{}' not found", session_id));
+        }
+        if self
+            .sessions
+            .values()
+            .any(|session| session.name == name && session.id != session_id)
+        {
+            return Err(format!("Session name '{}' already exists", name));
+        }
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.name = name;
+            session.touch();
+        }
+        self.save_sessions();
+        Ok(())
+    }
+
     pub fn delete_session(&mut self, session_id: &str) -> Result<(), String> {
         if !self.sessions.contains_key(session_id) {
             return Err(format!("Session '{}' not found", session_id));
@@ -184,6 +203,30 @@ impl SessionManager {
 
     pub fn get_session_config(&self, session_id: &str) -> Option<Config> {
         self.sessions.get(session_id).map(Session::get_config)
+    }
+
+    pub fn clear_session(&mut self, session_id: &str) -> bool {
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.clear_messages();
+            self.save_sessions();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn compact_session_to_recent(
+        &mut self,
+        session_id: &str,
+        min_recent_messages: usize,
+    ) -> Result<usize, String> {
+        let session = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or_else(|| format!("Session '{}' not found", session_id))?;
+        let cutoff = session.compact_to_recent(min_recent_messages)?;
+        self.save_sessions();
+        Ok(cutoff)
     }
 
     pub fn clear_current_session(&mut self) {

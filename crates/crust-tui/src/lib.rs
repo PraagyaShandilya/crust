@@ -3,12 +3,13 @@ mod tui;
 
 use app::*;
 use crust_core::{
-    ContextBuilder, agent_main_run, commands::*, context, env_duration_secs_or_default,
-    format_current_session_title, format_scoped_agents, format_token_count, langgraph::*,
-    models_generated, parse_scoped_agent_command, scoped_agent_run, skills::*, spaces::*,
+    ContextBuilder, SettingsManager, agent_main_run, commands::*, context,
+    core_profile, env_duration_secs_or_default, format_current_session_title,
+    format_scoped_agents, format_token_count, langgraph::*, models_generated,
+    parse_scoped_agent_command, scoped_agent_run, skills::*, spaces::*,
 };
 use crust_types::{
-    AgentEvent, AgentState, CrustSpace, LangGraphServer, ScopedAgentStatus, SpaceStatus,
+    AgentEvent, AgentState, CoreKind, CrustSpace, LangGraphServer, ScopedAgentStatus, SpaceStatus,
     TaggedAgentEvent,
 };
 use openrouter_rs::{api::chat::Message, types::Role};
@@ -31,7 +32,7 @@ use ratatui::{
     crossterm::{
         event::{
             self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
-            MouseEventKind,
+            KeyModifiers, MouseEventKind,
         },
         execute,
         terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -165,6 +166,22 @@ where
                     continue;
                 }
 
+                if key.code == KeyCode::Char('s')
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    if app.inputstate == InputState::Settings {
+                        close_settings(app);
+                    } else {
+                        open_settings(app);
+                    }
+                    continue;
+                }
+
+                if app.inputstate == InputState::Settings {
+                    handle_settings_key(app, key.code);
+                    continue;
+                }
+
                 // Global keys that work regardless of focus
                 match key.code {
                     KeyCode::Esc => {
@@ -181,7 +198,8 @@ where
                     KeyCode::Tab => {
                         app.focus = match app.focus {
                             Focus::Input => Focus::Sidebar,
-                            Focus::Sidebar => Focus::Input,
+                            Focus::Sidebar => Focus::Events,
+                            Focus::Events => Focus::Input,
                         };
                         continue;
                     }
@@ -431,6 +449,62 @@ where
                         }
                         _ => {}
                     },
+                    Focus::Events => match key.code {
+                        KeyCode::Left | KeyCode::Right => {
+                            let all_cores = CoreKind::all();
+                            let current_index = all_cores
+                                .iter()
+                                .position(|k| *k == app.core_kind)
+                                .unwrap_or(0);
+                            let next_index = if key.code == KeyCode::Left {
+                                current_index.saturating_sub(1)
+                            } else {
+                                (current_index + 1).min(all_cores.len() - 1)
+                            };
+                            let new_kind = all_cores[next_index];
+                            if new_kind != app.core_kind {
+                                app.core_kind = new_kind;
+                                let profile = core_profile(new_kind);
+                                app.system_message = profile.system_prompt;
+                                let mut sm = app.sessionmanager.lock().await;
+                                if let Some(session) = sm.get_current_session_mut() {
+                                    session.core_profile = new_kind;
+                                    if let Some(default_model) = profile.default_model {
+                                        session.config.modelname = default_model.to_string();
+                                    }
+                                }
+                                app.eventlog.push(LogEntry::System(format!(
+                                    "Switched core to: {} ({})",
+                                    profile.display_name, profile.description
+                                )));
+                            }
+                        }
+                        KeyCode::Up => {
+                            app.event_scroll = app.event_scroll.saturating_sub(3);
+                            app.follow_mode = false;
+                        }
+                        KeyCode::Down => {
+                            app.event_scroll = app.event_scroll.saturating_add(3);
+                            app.follow_mode = app.event_scroll >= app.event_max_scroll;
+                        }
+                        KeyCode::PageUp => {
+                            app.event_scroll = app.event_scroll.saturating_sub(10);
+                            app.follow_mode = false;
+                        }
+                        KeyCode::PageDown => {
+                            app.event_scroll = app.event_scroll.saturating_add(10);
+                            app.follow_mode = app.event_scroll >= app.event_max_scroll;
+                        }
+                        KeyCode::Home => {
+                            app.event_scroll = 0;
+                            app.follow_mode = false;
+                        }
+                        KeyCode::End => {
+                            app.event_scroll = usize::MAX;
+                            app.follow_mode = true;
+                        }
+                        _ => {}
+                    },
                 }
             }
             _ => {}
@@ -448,6 +522,11 @@ async fn handle_session_command(
         app.inputstate = InputState::Exit;
         app.eventlog
             .push(LogEntry::System("Crust agent quitting.....".to_string()));
+        return true;
+    }
+
+    if prompt == "/settings" {
+        open_settings(app);
         return true;
     }
 
@@ -1124,4 +1203,129 @@ async fn handle_session_command(
     }
 
     false
+}
+
+fn open_settings(app: &mut App) {
+    let settings = SettingsManager::new().load().unwrap_or_default();
+    app.settings_draft = settings;
+    app.settings_selected_field = 0;
+    app.settings_input_buffer = String::new();
+    app.inputstate = InputState::Settings;
+}
+
+fn close_settings(app: &mut App) {
+    save_settings_input_buffer(app);
+    let draft = app.settings_draft.clone();
+    if let Err(err) = SettingsManager::new().save(&draft) {
+        app.eventlog
+            .push(LogEntry::Error(format!("Failed to save settings: {err}")));
+    }
+    if draft.default_core != app.core_kind {
+        app.core_kind = draft.default_core;
+        app.system_message = core_profile(draft.default_core).system_prompt;
+    }
+    app.eventlog
+        .push(LogEntry::System("Settings saved.".to_string()));
+    app.inputstate = InputState::FieldInput;
+}
+
+fn handle_settings_key(app: &mut App, key_code: KeyCode) {
+    match key_code {
+        KeyCode::Esc => {
+            close_settings(app);
+        }
+        KeyCode::Up => {
+            save_settings_input_buffer(app);
+            if app.settings_selected_field > 0 {
+                app.settings_selected_field -= 1;
+            }
+            load_settings_input_buffer(app);
+        }
+        KeyCode::Down => {
+            save_settings_input_buffer(app);
+            if app.settings_selected_field < 2 {
+                app.settings_selected_field += 1;
+            }
+            load_settings_input_buffer(app);
+        }
+        KeyCode::Left => {
+            if app.settings_selected_field == 0 {
+                cycle_core_kind(app, false);
+            }
+        }
+        KeyCode::Right | KeyCode::Enter => {
+            if app.settings_selected_field == 0 {
+                cycle_core_kind(app, true);
+            }
+        }
+        KeyCode::Char(c) => match app.settings_selected_field {
+            1 => {
+                app.settings_input_buffer.push(c);
+            }
+            2 => {
+                if c.is_ascii_digit() {
+                    app.settings_input_buffer.push(c);
+                }
+            }
+            _ => {}
+        },
+        KeyCode::Backspace => {
+            if app.settings_selected_field > 0 {
+                app.settings_input_buffer.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn save_settings_input_buffer(app: &mut App) {
+    match app.settings_selected_field {
+        1 => {
+            let trimmed = app.settings_input_buffer.trim().to_string();
+            app.settings_draft.default_model = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            };
+        }
+        2 => {
+            let trimmed = app.settings_input_buffer.trim().to_string();
+            app.settings_draft.max_agent_steps = if trimmed.is_empty() {
+                None
+            } else {
+                trimmed.parse::<u32>().ok()
+            };
+        }
+        _ => {}
+    }
+}
+
+fn load_settings_input_buffer(app: &mut App) {
+    app.settings_input_buffer = match app.settings_selected_field {
+        1 => app
+            .settings_draft
+            .default_model
+            .clone()
+            .unwrap_or_default(),
+        2 => app
+            .settings_draft
+            .max_agent_steps
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        _ => String::new(),
+    };
+}
+
+fn cycle_core_kind(app: &mut App, forward: bool) {
+    let all = CoreKind::all();
+    let current_index = all
+        .iter()
+        .position(|k| *k == app.settings_draft.default_core)
+        .unwrap_or(0);
+    let next_index = if forward {
+        (current_index + 1) % all.len()
+    } else {
+        (current_index + all.len() - 1) % all.len()
+    };
+    app.settings_draft.default_core = all[next_index];
 }

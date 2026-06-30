@@ -1,4 +1,5 @@
 import type { Config } from 'tailwindcss';
+import typography from '@tailwindcss/typography';
 
 export default {
   content: ['./index.html', './src/**/*.{ts,tsx}'],
@@ -6,11 +7,18 @@ export default {
     extend: {
       colors: {
         crust: {
-          ink: '#10131a',
-          panel: '#171b24',
-          line: '#2d3442',
-          mint: '#8ee6c3',
-          amber: '#f3c969',
+          ink: '#050505',
+          panel: '#0b0b0b',
+          coal: '#111111',
+          line: '#2a1608',
+          mint: '#ff6a00',
+          amber: '#ff9a1f',
+          ember: '#ff3d00',
+          text: {
+            DEFAULT: '#fff7ed',
+            muted: '#ffedd5',
+            subtle: '#fdba74',
+          },
         },
       },
       fontFamily: {
@@ -19,5 +27,5 @@ export default {
       },
     },
   },
-  plugins: [],
+  plugins: [typography],
 } satisfies Config;

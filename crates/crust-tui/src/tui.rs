@@ -1,15 +1,15 @@
-use crate::{App, Focus, LogEntry, SidebarMode};
+use crate::{App, Focus, InputState, LogEntry, SidebarMode};
 use crust_core::{
     commands::get_filtered_commands, compact_tool_call_text, compact_tool_result_text, context,
     langgraph::list_langgraph_run_records, models_generated, spaces::load_spaces_registry,
 };
-use crust_types::AgentState;
+use crust_types::{AgentState, CoreKind};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     text::Line,
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
 pub(crate) fn ui(frame: &mut Frame, app: &mut App) {
@@ -200,6 +200,13 @@ pub(crate) fn ui(frame: &mut Frame, app: &mut App) {
         Style::default().fg(Color::Magenta)
     };
     let mut right_lines = Vec::new();
+    let core_color = match app.core_kind {
+        CoreKind::General => Color::Green,
+        CoreKind::Learning => Color::Cyan,
+        CoreKind::PairProgramming => Color::Magenta,
+    };
+    right_lines.push(format!("{}", app.core_kind));
+    right_lines.push(String::new());
     right_lines.push("Spaces".to_string());
     match load_spaces_registry() {
         Ok(registry) if registry.spaces.is_empty() => right_lines.push("  none".to_string()),
@@ -285,6 +292,9 @@ pub(crate) fn ui(frame: &mut Frame, app: &mut App) {
             )
             .wrap(Wrap { trim: false });
         frame.render_widget(scoped_pane, scoped_agents_area);
+    }
+    if app.inputstate == InputState::Settings {
+        render_settings_overlay(frame, app, v_chunks[0]);
     }
     frame.render_widget(input_pane, v_chunks[1]);
     frame.render_widget(right_pane, h_chunks[2]);
@@ -382,4 +392,75 @@ pub(crate) fn log_entry_to_wrapped_lines(entry: &LogEntry, width: usize) -> Vec<
         ),
     }
     lines
+}
+
+fn render_settings_overlay(frame: &mut Frame, app: &App, area: Rect) {
+    let overlay_width = 52.min(area.width.saturating_sub(4));
+    let overlay_height = 9.min(area.height.saturating_sub(2));
+    if overlay_width < 20 || overlay_height < 5 {
+        return;
+    }
+    let x = area.x + (area.width.saturating_sub(overlay_width)) / 2;
+    let y = area.y + (area.height.saturating_sub(overlay_height)) / 2;
+    let overlay_area = Rect::new(x, y, overlay_width, overlay_height);
+
+    frame.render_widget(Clear, overlay_area);
+
+    let field_labels = ["Default Core", "Default Model", "Max Agent Steps"];
+
+    let lines: Vec<Line> = field_labels
+        .iter()
+        .enumerate()
+        .map(|(i, label)| {
+            let is_selected = i == app.settings_selected_field;
+            let style = if is_selected {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let indicator = if is_selected { " > " } else { "   " };
+            let value_str = match i {
+                0 => format!("{}", app.settings_draft.default_core),
+                1 => {
+                    if is_selected {
+                        if app.settings_input_buffer.is_empty() {
+                            "(none)".to_string()
+                        } else {
+                            format!("{}█", app.settings_input_buffer)
+                        }
+                    } else {
+                        app.settings_draft
+                            .default_model
+                            .clone()
+                            .unwrap_or_else(|| "(none)".to_string())
+                    }
+                }
+                2 => {
+                    if is_selected {
+                        if app.settings_input_buffer.is_empty() {
+                            "(none)".to_string()
+                        } else {
+                            format!("{}█", app.settings_input_buffer)
+                        }
+                    } else {
+                        app.settings_draft
+                            .max_agent_steps
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "(none)".to_string())
+                    }
+                }
+                _ => String::new(),
+            };
+            Line::styled(format!("{}{}: {}", indicator, label, value_str), style)
+        })
+        .collect();
+
+    let settings_pane = Paragraph::new(lines).block(
+        Block::default()
+            .title(" Settings (Ctrl+S to close) ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
+
+    frame.render_widget(settings_pane, overlay_area);
 }

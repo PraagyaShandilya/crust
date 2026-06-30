@@ -4,8 +4,8 @@
 
 :root {
   color-scheme: dark;
-  background: #10131a;
-  color: #f5f7fb;
+  background: #050505;
+  color: #fff7ed;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
@@ -16,6 +16,30 @@ body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
+  overflow: hidden;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+* {
+  scrollbar-color: #ff6a00 #0b0b0b;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0b0b0b;
+}
+
+::-webkit-scrollbar-thumb {
+  background: linear-gradient(180deg, #ff9a1f, #ff3d00);
+  border-radius: 999px;
+  border: 2px solid #0b0b0b;
 }
 
 button,

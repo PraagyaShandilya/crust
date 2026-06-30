@@ -135,6 +135,22 @@ pub enum CoreKind {
     PairProgramming,
 }
 
+impl CoreKind {
+    pub fn all() -> &'static [CoreKind] {
+        &[CoreKind::General, CoreKind::Learning, CoreKind::PairProgramming]
+    }
+}
+
+impl fmt::Display for CoreKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CoreKind::General => write!(f, "Build"),
+            CoreKind::Learning => write!(f, "Learning"),
+            CoreKind::PairProgramming => write!(f, "Pair Programming"),
+        }
+    }
+}
+
 impl fmt::Display for ScopedAgentStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
